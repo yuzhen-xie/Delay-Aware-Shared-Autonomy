@@ -1,0 +1,105 @@
+seed: 20261014
+simulation:
+  control_dt: 0.001
+  decision_dt: 0.02
+  max_seconds: 18.0
+  mass: 1.2
+  damping: 12.0
+  robot_radius: 0.025
+  force_limit: 18.0
+  workspace_min: [0.02, -0.55, 0.02]
+  workspace_max: [0.95, 0.55, 0.85]
+  grasp_tolerance: 0.045
+  place_tolerance: 0.055
+  dwell_seconds: 0.16
+  max_grasp_speed: 0.18
+  lift_height: 0.48
+  feedback_delay: 0.8
+  command_delay: 0.0
+  jitter_seconds: 0.0
+scene:
+  provenance: known_scene_simulation
+  frame: base
+  goals: [[0.56, -0.25, 0.12], [0.64, 0.0, 0.12], [0.55, 0.24, 0.12]]
+  place: [0.80, 0.29, 0.12]
+  start: [0.16, -0.10, 0.46]
+  obstacles:
+    - {id: center, center: [0.43, 0.0, 0.23], radius: 0.075}
+    - {id: left, center: [0.35, -0.28, 0.19], radius: 0.060}
+  training_translation: 0.025
+  novel_translation: [0.05, 0.15]
+  added_obstacle_radius: 0.055
+motion:
+  attractive_gain: 22.0
+  repulsive_gain: 0.20
+  repulsive_sigma: 0.11
+  repulsive_limit: 8.0
+  distance_min: 0.08
+  distance_max: 0.25
+  lambda_gain: 10.0
+  risk_distance: center
+  kalman_process: 0.08
+  kalman_measurement: 0.8
+arbitration:
+  stiffness: 28.0
+  damping: 5.0
+  covariance_lower: 0.00003
+  covariance_upper: 0.006
+  roughness_gamma: 0.012
+  roughness_window: 15
+  epsilon: 0.000001
+  low_confidence_threshold: 0.12
+  correction_distance: 0.12
+  rho_window_seconds: 1.0
+passivity:
+  initial_energy: 1.0
+  maximum_energy: 8.0
+  input_efficiency: 0.9
+  tolerance: 0.00000001
+intent:
+  beta: 3.0
+  confidence_threshold: 0.6
+  sustained_seconds: 0.20
+  memory_decay: 0.9
+  hidden_dim: 64
+  latent_dim: 8
+  sequence_window: 16
+  transformer_heads: 4
+  transformer_layers: 2
+  batch_size: 256
+  epochs: 35
+  learning_rate: 0.001
+  kl_weight: 0.05
+  deviation_weight: 0.2
+  deviation_objective: auxiliary
+skill:
+  states: 7
+  trajectory_samples: 140
+  covariance_floor: 0.00001
+  duration_floor: 1.5
+  em_iterations: 6
+  lqt_control_cost: 0.01
+  original_weight: 1.0
+  new_weight: 1.0
+  refinement_count: 20
+operator:
+  kp: 26.0
+  kd: 7.0
+  expert_noise: 0.15
+  noisy_noise: 0.9
+  corrective_gain: 1.0
+experiments:
+  intent_delays: [0.0, 0.4, 0.8, 1.5]
+  sharing_delays: [0.0, 0.4, 0.8, 1.5]
+  conditions: [C1, C2, C3, C4, delay_br_shared, C3_guarded]
+  scenarios: [demonstrated, novel, wider, extra_obstacles]
+  bootstrap_demonstrations: 20
+  validation_demonstrations: 6
+  test_demonstrations: 12
+  simulated_operators: 12
+  trials_per_condition: 2
+  independent_repeats: 10
+  autonomy_trials: 100
+  bootstrap_samples: 5000
+  permutation_samples: 20000
+  port_bench_steps: 20000

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "delay-aware-shared-autonomy"
+version = "0.1.0"
+description = "Reproducible experiments in delayed intent inference and demonstration-based shared control"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "numpy==2.3.5", "scipy==1.17.0", "torch==2.6.0",
+  "matplotlib==3.10.8", "PyYAML==6.0.3"
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2", "ruff==0.14.1"]
+
+[project.scripts]
+dasa = "dasa.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

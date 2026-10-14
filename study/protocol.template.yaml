@@ -1,0 +1,22 @@
+approval_id: null
+ethics_body: null
+consent_procedure: null
+screening: null
+recruitment: null
+experience_definition: null
+practice_trials: null
+analysis_plan_frozen_on: null
+design: within_subjects
+expected_participants: null
+conditions: [C1, C2, C3, C4]
+feedback_delays_seconds: [0.0, 0.4, 0.8, 1.5]
+randomization_seed: 20261014
+primary_outcomes: [success_rate, completion_seconds]
+secondary_outcomes: [minimum_clearance_m, jerk_rms, raw_tlx]
+unit_of_analysis: participant
+test: paired_two_sided_sign_permutation
+multiple_comparison_correction: Holm
+confidence_intervals: paired_participant_bootstrap_95_percent
+missingness: retain_failures_in_success_rate_and_report_success_conditioned_time
+tlx_performance_direction: higher_means_greater_workload
+limitations: null
