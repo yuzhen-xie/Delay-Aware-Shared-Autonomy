@@ -1,22 +1,36 @@
-approval_id: null
-ethics_body: null
-consent_procedure: null
-screening: null
-recruitment: null
-experience_definition: null
-practice_trials: null
-analysis_plan_frozen_on: null
+schema_version: 2
+record_status: prospective
+study_id: dasa-study-v1
+analysis_plan_frozen_on: '2026-10-20'
 design: within_subjects
-expected_participants: null
+expected_participants: 20
 conditions: [C1, C2, C3, C4]
 feedback_delays_seconds: [0.0, 0.4, 0.8, 1.5]
+command_delay_seconds: 0.0
+tlx_delays_seconds: [0.8]
+workload_figure_delay_seconds: 0.8
+trial_timeout_seconds: 60.0
+timing_tolerance_seconds: 0.02
+practice_trials: 8
+practice_trial_timeout_seconds: 60.0
+practice_sequence: [[C1, 0.0], [C1, 0.0], [C1, 0.4], [C1, 0.8], [C3, 0.0], [C3, 0.4], [C3, 0.8], [C3, 0.8]]
 randomization_seed: 20261014
+scoring:
+  success: correct_goal_grasp_lift_and_place_before_timeout_without_collision_or_bounds_violation
+  completion_seconds: start_to_valid_place_for_successful_trials
+  minimum_clearance_m: minimum_TCP_surface_clearance_over_the_entire_trial
+  jerk_rms: RMS_norm_of_translational_jerk_in_metres_per_second_cubed
+  timeout_penalized_seconds: completion_time_if_success_else_declared_timeout
+exclusion_rules:
+  excluded: [practice, documented_device_fault, documented_corrupt_record, participant_not_included]
+  retained_as_failures: [collision, bounds_violation, wrong_goal, timeout]
 primary_outcomes: [success_rate, completion_seconds]
-secondary_outcomes: [minimum_clearance_m, jerk_rms, raw_tlx]
+secondary_outcomes: [minimum_clearance_m, jerk_rms, timeout_penalized_seconds]
 unit_of_analysis: participant
 test: paired_two_sided_sign_permutation
 multiple_comparison_correction: Holm
-confidence_intervals: paired_participant_bootstrap_95_percent
+confidence_intervals: paired_participant_bootstrap_95_percent_pointwise
+task_family: all_conditions_delays_and_task_metrics
+workload_family: RTLX_and_six_scales_all_conditions_and_declared_TLX_delays
 missingness: retain_failures_in_success_rate_and_report_success_conditioned_time
 tlx_performance_direction: higher_means_greater_workload
-limitations: null

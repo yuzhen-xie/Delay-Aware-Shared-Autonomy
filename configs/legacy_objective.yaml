@@ -1,0 +1,6 @@
+# Compatibility profile for explicitly identified earlier training runs.
+intent:
+  objective: legacy_weighted_auxiliary
+  kl_weight: 0.05
+  deviation_weight: 0.2
+  deviation_objective: auxiliary

@@ -55,7 +55,7 @@ def authority(condition: ControlCondition, autonomous: float, human: float, conf
     if rule == "full":
         return 1.0, 1.0
     if rule == "fixed":
-        return 0.5, 1.0
+        return c.get("fixed_weight", 0.5), 1.0
     if rule == "autonomy_confidence":
         return autonomous, 1.0
     alpha = autonomous / (autonomous + human + c["epsilon"])
@@ -64,5 +64,5 @@ def authority(condition: ControlCondition, autonomous: float, human: float, conf
         # Relative confidence does not represent absolute command reliability.
         scale = min(1.0, (autonomous + human) / c["low_confidence_threshold"])
         if corrective and clearance < c["correction_distance"]:
-            alpha = min(alpha, 0.15)
+            alpha = min(alpha, c.get("guarded_corrective_max", 0.15))
     return float(alpha), float(scale)

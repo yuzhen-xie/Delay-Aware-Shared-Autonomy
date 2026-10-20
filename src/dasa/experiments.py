@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import time
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,7 @@ from dasa.data import Demonstration, generate_dataset, validate_partitions, synt
 from dasa.geometry import make_scene
 from dasa.metrics import intent_metrics, silhouette, trial_metrics
 from dasa.models.dmp import DMP, DMPIntent
-from dasa.models.hsmm import TPHSMM, refine
+from dasa.models.hsmm import TPHSMM, refine, demonstration_fingerprint
 from dasa.models.intent import IntentEstimator, ReferenceBank, load_models, train_intent, training_arrays
 from dasa.simulation import run_trial
 from dasa.statistics import comparisons
@@ -33,22 +34,53 @@ def prepare(config: dict, root: Path):
     train_dataset(config, data, root)
 
 
+def snapshot_dataset(data: Path, root: Path) -> Path:
+    """Copy only declared split recordings into a portable prepared-run layout."""
+    splits = json.loads((data / "splits.json").read_text())
+    validate_partitions(data, splits)
+    target = root / "dataset"
+    if data.resolve() == target.resolve():
+        return data
+    if target.exists() and any(target.iterdir()):
+        raise ValueError("Dataset snapshot already contains files; use a new output path")
+    target.mkdir(parents=True, exist_ok=True)
+    for name in [name for paths in splits.values() for name in paths]:
+        source = (data / name).resolve()
+        if not source.is_relative_to(data.resolve()):
+            raise ValueError("Dataset split paths must stay within the dataset root")
+        destination = target / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    shutil.copyfile(data / "splits.json", target / "splits.json")
+    validate_partitions(target, splits)
+    return target
+
+
 def train_dataset(config: dict, data: Path, root: Path):
     seed_everything(config["seed"])
+    data = snapshot_dataset(data, root)
     train, validation = load_split(data, "train"), load_split(data, "validation")
     models = root / "models"
     models.mkdir(parents=True, exist_ok=True)
     skill = TPHSMM(config).fit(train)
     skill.save(models / "bootstrap_hsmm.npz")
     write_json(models / "hsmm_fit.json", skill.history)
+    write_json(models / "bootstrap_inventory.json", skill.fit_manifest)
     DMP().fit(train).save(models / "dmp.npz")
     history = train_intent(config, training_arrays(train, skill, config),
                            training_arrays(validation, skill, config), models)
     write_json(models / "training.json", history)
-    files = sorted(data.glob("*/*.npz"))
+    split_manifest = json.loads((data / "splits.json").read_text())
+    files = [data / "splits.json", *sorted({data / name for paths in split_manifest.values()
+                                           for name in paths})]
     run_manifest = manifest(config, "train_dataset", files)
     run_manifest["data_provenance"] = sorted({d.metadata["provenance"] for d in train + validation})
     write_json(root / "manifest.json", run_manifest)
+    write_json(root / "dataset_inventory.json", {
+        "split_policy": "episode_and_operator_disjoint",
+        "splits": {name: [{"file": name_path, **demonstration_fingerprint(
+            Demonstration.load(data / name_path))} for name_path in paths]
+            for name, paths in json.loads((data / "splits.json").read_text()).items()}})
     print(f"Prepared {len(train)} bootstrap and {len(validation)} validation demonstrations", flush=True)
 
 
@@ -59,14 +91,24 @@ def refine_dataset(config: dict, data: Path, candidates: Path, output: Path):
     held_out_operators = {d.metadata["operator_id"] for d in held_out}
     if any(d.metadata["operator_id"] in held_out_operators for d in new):
         raise ValueError("Refinement operators overlap held-out partitions")
+    held_out_hashes = {demonstration_fingerprint(d)["signal_sha256"] for d in held_out}
+    if any(demonstration_fingerprint(d)["signal_sha256"] in held_out_hashes for d in new):
+        raise ValueError("Refinement signals overlap held-out partitions")
     model, audit, accepted = refine(config, original, new)
     output.mkdir(parents=True, exist_ok=True)
     model.save(output / "refined_hsmm.npz")
     write_json(output / "selection_audit.json", audit)
+    write_json(output / "training_inventory.json", model.fit_manifest)
+    write_json(output / "manifest.json", manifest(config, "refine_dataset", [
+        data / "splits.json", *sorted(data.glob("*/*.npz")), *sorted(candidates.glob("*.npz"))]))
     write_json(output / "refinement_metadata.json", {
         "original_count": len(original), "candidate_count": len(new), "accepted_count": len(accepted),
         "required_count": config["skill"]["refinement_count"],
         "quota_met": len(accepted) == config["skill"]["refinement_count"],
+        "candidate_order": "filename_lexicographic_order",
+        "confirmatory_eligible": len(accepted) == config["skill"]["refinement_count"],
+        "comparison_status": "eligible" if len(accepted) == config["skill"]["refinement_count"]
+        else "diagnostic_only_incomplete_quota",
         "provenance": sorted({d.metadata["provenance"] for d in original + new}),
         "weights": {"original": config["skill"]["original_weight"], "new": config["skill"]["new_weight"]}})
 
@@ -97,7 +139,8 @@ def sharing(config: dict, root: Path):
     write_json(root / "sharing/metrics.json", rows)
     methods = [name for name in e["conditions"] if name != "C3"]
     stats = comparisons(rows, "C3", methods,
-                        ["success_rate", "completion_seconds", "minimum_clearance_m", "jerk_rms"], config)
+                        ["success_rate", "completion_seconds", "minimum_clearance_m", "jerk_rms"], config,
+                        family="sharing_all_delays_methods_metrics", planned_delays=e["sharing_delays"])
     write_json(root / "sharing/statistics.json", stats)
     return rows
 
@@ -148,7 +191,9 @@ def intent_experiment(config: dict, root: Path):
         print(f"Intent inference: delay {delay:.1f}s, {len(demos)} held-out episodes", flush=True)
     write_json(root / "intent/metrics.json", rows)
     write_json(root / "intent/statistics.json", comparisons(
-        rows, "full", [m for m in methods if m != "full"], ["ipa", "accuracy", "nll", "brier"], config))
+        rows, "full", [m for m in methods if m != "full"],
+        ["ipa", "accuracy", "nll", "brier", "early_prediction_seconds", "prediction_stability"], config,
+        family="intent_all_delays_methods_metrics", planned_delays=config["experiments"]["intent_delays"]))
     write_json(root / "intent/latent_diagnostics.json", {
         "silhouette": silhouette(np.asarray(latent_values), np.asarray(labels), config["seed"])
         if latent_values else None, "interpretation": "goal separability only; cognitive state and skill are unvalidated"})
@@ -156,8 +201,11 @@ def intent_experiment(config: dict, root: Path):
 
 
 def refinement_experiment(config: dict, root: Path):
-    cvae, _ = load_models(config, root / "models")
     original = load_split(root / "dataset", "train")
+    if not original or not all(d.metadata["provenance"].startswith("synthetic") for d in original):
+        raise ValueError("Simulation refinement requires synthetic bootstrap; "
+                         "measured collections use refine-data/generalization")
+    cvae, _ = load_models(config, root / "models")
     rows, audits, budgets = [], [], []
     e = config["experiments"]
     for repeat in range(e["independent_repeats"]):
@@ -170,9 +218,12 @@ def refinement_experiment(config: dict, root: Path):
                                         f"bootstrap_r{repeat}_{j}", demo.goal)
             bootstrap.append(d)
         base = TPHSMM(config).fit(bootstrap)
+        for d in bootstrap:
+            d.save(root / f"refinement/bootstrap/r{repeat}/{d.metadata['episode_id']}.npz")
+        base.save(root / f"refinement/models/bootstrap_r{repeat}.npz")
         for name in ("C1", "C2", "C3"):
             candidates, accepted_count = [], 0
-            max_attempts = config["skill"]["refinement_count"] * 5
+            max_attempts = config["skill"]["refinement_count"] * e.get("collection_attempt_multiplier", 5)
             c = copy.deepcopy(config)
             c["simulation"]["feedback_delay"] = 0.8
             from dasa.data import successful
@@ -211,6 +262,9 @@ def refinement_experiment(config: dict, root: Path):
                     metrics["scenario"] = scenario
                     metrics["repeat"] = repeat
                     metrics["refinement_quota_met"] = budgets[-1]["quota_met"]
+                    metrics["confirmatory_eligible"] = budgets[-1]["quota_met"]
+                    metrics["comparison_status"] = "eligible" if budgets[-1]["quota_met"] else \
+                        "diagnostic_only_incomplete_quota"
                     rows.append(metrics)
             print(f"Refinement {name}, repeat {repeat + 1}: {len(accepted)}/{c['skill']['refinement_count']} accepted", flush=True)
     write_json(root / "refinement/metrics.json", rows)
@@ -218,15 +272,27 @@ def refinement_experiment(config: dict, root: Path):
     write_json(root / "refinement/budgets.json", budgets)
     stats = []
     for scenario in e["scenarios"]:
-        subset = [r for r in rows if r["scenario"] == scenario]
+        subset = [r for r in rows if r["scenario"] == scenario and r["confirmatory_eligible"]]
         results = comparisons(subset, "C3", ["C1", "C2"],
-                              ["success_rate", "reference_error_m"], config)
+                              ["success_rate", "reference_error_m"], config,
+                              family=f"refinement_{scenario}", planned_delays=[0.8])
         stats.extend([{**r, "scenario": scenario} for r in results])
     # Correct across all scenarios, rather than separately within each scenario.
     from dasa.statistics import holm
-    for row, corrected in zip(stats, holm([r["p_raw"] for r in stats])):
-        row["p_holm"] = corrected
+    corrected_values = holm([r["p_raw"] for r in stats], family_size=len(stats))
+    for row, corrected in zip(stats, corrected_values):
+        row.update(p_holm=corrected, family="refinement_all_scenarios_methods_metrics",
+                   family_size_planned=len(stats),
+                   family_size_estimable=sum(r["p_raw"] is not None for r in stats),
+                   correction="Holm_step_down_FWER",
+                   significant_holm=corrected < .05 if corrected is not None else None)
     write_json(root / "refinement/statistics.json", stats)
+    write_json(root / "refinement/protocol_status.json", {
+        "procedure_completed": True, "protocol_complete": all(b["quota_met"] for b in budgets),
+        "incomplete_fits": [b for b in budgets if not b["quota_met"]],
+        "statistics_policy": "exclude_incomplete_quota_fits_before_unit_pairing",
+        "independent_unit": "training_repeat", "bootstrap_policy": "fresh_synthetic_demonstrations_per_repeat",
+        "models": "models/{condition}_r{repeat}.npz includes full training inventory"})
     return rows
 
 
@@ -268,5 +334,8 @@ def run_all(config: dict, root: Path):
     run_ports(config, root / "ports")
     from dasa.reporting import report
     report(config, root)
-    write_json(root / "run_status.json", {"completed": True, "elapsed_seconds": time.monotonic() - started,
+    refinement_status = json.loads((root / "refinement/protocol_status.json").read_text())
+    write_json(root / "run_status.json", {"completed": True,
+                                          "protocol_complete": refinement_status["protocol_complete"],
+                                          "elapsed_seconds": time.monotonic() - started,
                                           "config": config, "provenance": "synthetic_task_space_simulation"})

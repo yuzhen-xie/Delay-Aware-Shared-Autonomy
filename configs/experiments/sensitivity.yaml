@@ -1,0 +1,15 @@
+# Validation-only tuning grid; held-out test results must not select parameters.
+tuning:
+  split: validation
+  primary_metric: success_rate
+  tie_breakers: [minimum_clearance_m, completion_seconds]
+  grids:
+    intent.beta: [1.0, 3.0, 5.0]
+    motion.lambda_gain: [5.0, 10.0, 20.0]
+    motion.distance_min: [0.06, 0.08, 0.10]
+    motion.distance_max: [0.20, 0.25, 0.30]
+    arbitration.roughness_gamma: [0.006, 0.012, 0.024]
+    motion.kalman_process: [0.04, 0.08, 0.16]
+    motion.kalman_measurement: [0.4, 0.8, 1.6]
+    motion.attractive_weight: [0.5, 1.0, 2.0]
+    motion.repulsive_weight: [0.5, 1.0, 2.0]

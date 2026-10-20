@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,13 +34,29 @@ class Demonstration:
             x = getattr(self, key)
             if x.shape != (n, dims) or not np.isfinite(x).all():
                 raise ValueError(f"Invalid {key} shape or non-finite data")
-        if self.phase.shape != (n,) or not 0 <= self.goal < len(self.scene.goals):
+        if (self.phase.shape != (n,) or not np.isin(self.phase, [0, 1, 2, 3]).all()
+                or not 0 <= self.goal < len(self.scene.goals)):
             raise ValueError("Invalid phase labels or intended goal")
         if self.scene.frame != "base":
             raise ValueError("Transform signals to the robot base frame before import")
+        scene = self.scene
+        if (scene.goals.shape != (3, 3) or scene.start.shape != (3,) or scene.place.shape != (3,)
+                or scene.centers.ndim != 2 or scene.centers.shape[1:] != (3,)
+                or scene.radii.shape != (len(scene.centers),) or len(scene.centers) < 1
+                or len(scene.obstacle_ids) != len(scene.centers)
+                or len(set(scene.obstacle_ids)) != len(scene.centers)
+                or np.any(scene.radii <= 0)
+                or not all(np.isfinite(x).all() for x in
+                           (scene.goals, scene.start, scene.place, scene.centers, scene.radii))):
+            raise ValueError("Invalid finite three-goal scene geometry or obstacle radii")
         for key in ("episode_id", "operator_id", "provenance", "success"):
             if key not in self.metadata:
                 raise ValueError(f"Missing metadata field: {key}")
+        if any(not isinstance(self.metadata[key], str) or not self.metadata[key].strip()
+               for key in ("episode_id", "operator_id", "provenance")):
+            raise ValueError("Episode, operator and provenance identifiers must be nonempty strings")
+        if not isinstance(self.metadata["success"], bool):
+            raise ValueError("success must be a JSON boolean")
 
     def save(self, path: Path) -> None:
         self.validate()
@@ -68,21 +85,25 @@ class Demonstration:
 
 
 def synthetic_demonstration(config: dict, seed: int, operator: str, episode: str,
-                            goal: int, noise: float = 0.15) -> Demonstration:
+                            goal: int, noise: float | None = None) -> Demonstration:
     """Quintic task-space demonstrations; these are never classified as participant data."""
     rng = np.random.default_rng(seed)
+    bootstrap = config.get("bootstrap", {})
+    noise = bootstrap.get("force_noise_std_N", 0.15) if noise is None else noise
     scene = make_scene(config, rng)
     points = waypoints(scene, goal, config["simulation"]["lift_height"])
     dt = config["simulation"]["decision_dt"]
     chunks, phases = [], []
     for j, (start, end) in enumerate(zip(points[:-1], points[1:])):
-        duration = max(0.45, np.linalg.norm(end - start) / rng.uniform(0.16, 0.24))
-        count = max(12, int(duration / dt))
+        speed = bootstrap.get("cruise_speed_m_s", [0.16, 0.24])
+        duration = max(bootstrap.get("segment_min_seconds", 0.45),
+                       np.linalg.norm(end - start) / rng.uniform(*speed))
+        count = max(bootstrap.get("minimum_segment_samples", 12), int(duration / dt))
         u = np.arange(count) / count
         smooth = 10 * u**3 - 15 * u**4 + 6 * u**5
         path = start + smooth[:, None] * (end - start)
         # Variability vanishes at task anchors and remains bounded between them.
-        side = rng.normal(0, 0.008, 3)
+        side = rng.normal(0, bootstrap.get("lateral_std_m", 0.008), 3)
         path += np.sin(np.pi * u)[:, None] ** 2 * side
         chunks.append(path)
         phases.extend([0 if j <= 2 else (1 if j == 3 else 2)] * count)
@@ -106,6 +127,7 @@ def synthetic_demonstration(config: dict, seed: int, operator: str, episode: str
 
 def generate_dataset(config: dict, root: Path) -> dict:
     splits = {}
+    inventory = []
     e = config["experiments"]
     count_fields = [("train", "bootstrap_demonstrations"),
                     ("validation", "validation_demonstrations"), ("test", "test_demonstrations")]
@@ -119,18 +141,39 @@ def generate_dataset(config: dict, root: Path) -> dict:
             demo = synthetic_demonstration(config, seed, operator, episode, j % 3)
             demo.save(path)
             paths.append(str(path.relative_to(root)))
+            inventory.append({"path": str(path.relative_to(root)), "split": split,
+                              "generation_order": len(inventory), "episode_id": episode,
+                              "operator_id": operator, "seed": seed, "goal": j % 3,
+                              "samples": len(demo.time), "duration_seconds": float(demo.time[-1]),
+                              "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                              "provenance": demo.metadata["provenance"], "scene": demo.scene.to_dict()})
         splits[split] = paths
     validate_partitions(root, splits)
     write_json(root / "splits.json", splits)
+    write_json(root / "inventory.json", {"schema_version": 1,
+        "generator": "quintic_bootstrap_v1", "generation_order": "train, validation, test; index ascending",
+        "split_seed_rule": "seed + 10000*split_index + episode_index",
+        "counts": {s: len(p) for s, p in splits.items()},
+        "fractions": {s: len(p) / len(inventory) for s, p in splits.items()}, "records": inventory})
     return splits
 
 
 def validate_partitions(root: Path, splits: dict) -> None:
-    seen_episodes, seen_operators = set(), set()
+    seen_episodes, seen_operators, seen_signals = set(), set(), set()
     for name, paths in splits.items():
-        episodes, operators = set(), set()
+        episodes, operators, signals = set(), set(), set()
         for path in paths:
-            demo = Demonstration.load(root / path)
+            resolved = (root / path).resolve()
+            if not resolved.is_relative_to(root.resolve()):
+                raise ValueError("Dataset entry escapes its root")
+            demo = Demonstration.load(resolved)
+            digest = hashlib.sha256()
+            for signal in (demo.time, demo.position, demo.velocity, demo.raw_force, demo.observed_state):
+                digest.update(np.asarray(signal, dtype='<f8').tobytes())
+            signal_hash = digest.hexdigest()
+            if signal_hash in signals or signal_hash in seen_signals:
+                raise ValueError("Duplicate signal data or leakage within or across partitions")
+            signals.add(signal_hash)
             episode = demo.metadata["episode_id"]
             if episode in episodes:
                 raise ValueError(f"Duplicate episode in {name}: {episode}")
@@ -140,6 +183,7 @@ def validate_partitions(root: Path, splits: dict) -> None:
             raise ValueError("Episode or operator leakage across partitions")
         seen_episodes |= episodes
         seen_operators |= operators
+        seen_signals |= signals
 
 
 def successful(demo: Demonstration, config: dict) -> tuple[bool, list[str]]:
@@ -151,13 +195,16 @@ def successful(demo: Demonstration, config: dict) -> tuple[bool, list[str]]:
         reasons.append("wrong_object")
     if m.get("collision", False) or m.get("bounds_violation", False):
         reasons.append("contact_or_bounds")
+    if np.any(demo.position < np.asarray(config["simulation"]["workspace_min"])) or np.any(
+            demo.position > np.asarray(config["simulation"]["workspace_max"])):
+        reasons.append("recorded_position_outside_workspace")
     radii = config["simulation"]["robot_radius"]
     if any(demo.scene.swept_clearance(a, b, radii) <= 0
            for a, b in zip(demo.position[:-1], demo.position[1:])):
         reasons.append("swept_collision")
     if np.linalg.norm(demo.position[-1] - demo.scene.place) > config["simulation"]["place_tolerance"]:
         reasons.append("placement_error")
-    if demo.time[-1] > config["simulation"]["max_seconds"]:
+    if demo.time[-1] - demo.time[0] > config["simulation"]["max_seconds"]:
         reasons.append("timeout")
     return not reasons, reasons
 

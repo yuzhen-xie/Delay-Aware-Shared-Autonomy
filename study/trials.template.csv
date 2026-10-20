@@ -1,1 +1,1 @@
-trial_id,participant_id,condition,delay_seconds,success,completion_seconds,minimum_clearance_m,jerk_rms,practice
+trial_id,participant_id,condition,delay_seconds,success,completion_seconds,elapsed_seconds,minimum_clearance_m,jerk_rms,termination,practice,exclude_reason,record_status

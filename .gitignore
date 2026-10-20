@@ -7,6 +7,10 @@ __pycache__/
 artifacts/
 data/raw/
 data/processed/
+data/study/
+data/collections/
+study/local/
+study/*.local.yaml
 *.mp4
 *.gif
 configs/*.local.yaml

@@ -8,6 +8,9 @@ explicit, truncated discrete-Gaussian dwell times and left-to-right transitions.
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import json
+import copy
 
 import numpy as np
 from scipy.special import logsumexp
@@ -16,6 +19,34 @@ from scipy.optimize import minimize
 from dasa.data import Demonstration, resample_positions, successful
 from dasa.geometry import Scene, task_frames
 
+
+
+def demonstration_fingerprint(demo: Demonstration) -> dict:
+    """Hashes numerical signals independently of labels to detect renamed copies."""
+    demo.validate()
+    digest = hashlib.sha256()
+    for key in ("time", "position", "velocity", "raw_force", "observed_state", "phase"):
+        array = np.ascontiguousarray(getattr(demo, key), dtype="<f8")
+        digest.update(key.encode())
+        digest.update(str(array.shape).encode())
+        digest.update(array.tobytes())
+    geometry_data = demo.scene.to_dict()
+    geometry_data.pop("provenance", None)
+    geometry_data.pop("obstacle_ids", None)
+    geometry = json.dumps({"scene": geometry_data, "goal": demo.goal},
+                          sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    digest.update(geometry)
+    signal_hash = digest.hexdigest()
+    record = json.dumps(demo.metadata, sort_keys=True, separators=(",", ":"),
+                        allow_nan=False).encode()
+    return {"episode_id": demo.metadata["episode_id"],
+            "operator_id": demo.metadata["operator_id"],
+            "provenance": demo.metadata["provenance"],
+            "source_condition": demo.metadata.get("source_condition"),
+            "goal": int(demo.goal), "samples": len(demo.time),
+            "duration_seconds": float(demo.time[-1] - demo.time[0]),
+            "signal_sha256": signal_hash,
+            "record_sha256": hashlib.sha256(bytes.fromhex(signal_hash) + record).hexdigest()}
 
 def gaussian_logpdf(x: np.ndarray, mean: np.ndarray, covariance: np.ndarray) -> np.ndarray:
     delta = x - mean
@@ -90,6 +121,7 @@ class TPHSMM:
         self.duration_std = np.full(self.k, self.samples / self.k / 3)
         self.history = []
         self.fit_ids = []
+        self.fit_manifest = {"available": False, "reason": "not_fitted"}
         self.duration_seconds = 9.0
 
     def world_gaussians(self, scene: Scene, goal: int):
@@ -116,8 +148,11 @@ class TPHSMM:
         if len(set(ids)) != len(ids):
             raise ValueError("Duplicated demonstrations would change the empirical weights")
         weights = np.ones(len(demos)) if weights is None else np.asarray(weights, dtype=float)
-        if weights.shape != (len(demos),) or np.any(weights <= 0):
+        if weights.shape != (len(demos),) or not np.isfinite(weights).all() or np.any(weights <= 0):
             raise ValueError("All demonstration weights must be positive")
+        records = [demonstration_fingerprint(d) for d in demos]
+        if len({record["signal_sha256"] for record in records}) != len(records):
+            raise ValueError("Duplicate demonstration signals would change empirical weights")
         paths = [resample_positions(d, self.samples) for d in demos]
         local = []
         for path, demo in zip(paths, demos):
@@ -127,6 +162,8 @@ class TPHSMM:
         labels = np.minimum(np.arange(self.samples) * self.k // self.samples, self.k - 1)
         responsibilities = [np.eye(self.k)[labels] for _ in demos]
         self.history = []
+        self.duration_mean = np.full(self.k, self.samples / self.k)
+        self.duration_std = np.full(self.k, self.samples / self.k / 3)
         for iteration in range(self.config["skill"]["em_iterations"] + 1):
             for k in range(self.k):
                 mass = sum(w * g[:, k].sum() for w, g in zip(weights, responsibilities))
@@ -167,6 +204,15 @@ class TPHSMM:
                     self.duration_mean[k], self.duration_std[k] = fitted.x
             self.history.append({"iteration": iteration, "weighted_log_likelihood": likelihood})
         self.fit_ids = ids
+        self.fit_manifest = {
+            "available": True, "schema_version": 1, "fit": "full_weighted_batch_refit",
+            "initialization": "equal_normalized_time_bins",
+            "states": self.k, "trajectory_samples": self.samples,
+            "task_frames": ["start", "object", "place"], "frame_rotations": "identity",
+            "skill_config": copy.deepcopy(self.config["skill"]),
+            "records": [{**record, "weight": float(weight)}
+                        for record, weight in zip(records, weights)],
+            "total_weight": float(weights.sum()), "history": self.history}
         self.duration_seconds = float(np.average([d.time[-1] - d.time[0] for d in demos],
                                                 weights=weights))
         return self
@@ -223,7 +269,8 @@ class TPHSMM:
         np.savez_compressed(path, means=self.means, covariances=self.covariances,
                             duration_mean=self.duration_mean, duration_std=self.duration_std,
                             duration_seconds=self.duration_seconds,
-                            fit_ids=np.asarray(self.fit_ids, dtype=str))
+                            fit_ids=np.asarray(self.fit_ids, dtype=str),
+                            fit_manifest=np.array(json.dumps(self.fit_manifest, allow_nan=False)))
 
     @classmethod
     def load(cls, config: dict, path: Path) -> "TPHSMM":
@@ -231,22 +278,54 @@ class TPHSMM:
         with np.load(path, allow_pickle=False) as d:
             for k in ("means", "covariances", "duration_mean", "duration_std"):
                 setattr(model, k, d[k].copy())
+            if (model.means.shape != (model.k, 3, 3) or
+                    model.covariances.shape != (model.k, 3, 3, 3)):
+                raise ValueError("TP-HSMM checkpoint state/frame dimensions do not match configuration")
             model.duration_seconds = float(d["duration_seconds"])
             model.fit_ids = d["fit_ids"].tolist()
+            model.fit_manifest = json.loads(str(d["fit_manifest"])) if "fit_manifest" in d else {
+                "available": False, "reason": "legacy_checkpoint_missing_training_records"}
+            if model.fit_manifest.get("available") and model.fit_manifest["trajectory_samples"] != model.samples:
+                raise ValueError("TP-HSMM checkpoint trajectory horizon does not match configuration")
         return model
 
 
 def refine(config: dict, original: list[Demonstration], candidates: list[Demonstration]):
+    """Refit on the original data and the first eligible, unique successes.
+
+    Candidate order is acquisition order supplied by the caller, never ranked by
+    subsequent evaluation outcomes. A short quota is retained as an incomplete
+    diagnostic fit; callers must exclude it from equal-budget inference.
+    """
     accepted, audit = [], []
+    quota = config["skill"]["refinement_count"]
+    if not isinstance(quota, int) or quota < 0:
+        raise ValueError("refinement_count must be a nonnegative integer")
+    seen_ids = {d.metadata["episode_id"] for d in original}
+    seen_hashes = {demonstration_fingerprint(d)["signal_sha256"] for d in original}
     for demo in candidates:
+        record = demonstration_fingerprint(demo)
         ok, reasons = successful(demo, config)
-        if ok and len(accepted) >= config["skill"]["refinement_count"]:
-            ok, reasons = False, ["quota_reached"]
+        reasons = list(reasons)
+        if record["episode_id"] in seen_ids or record["signal_sha256"] in seen_hashes:
+            reasons.append("duplicate_or_original_overlap")
+        seen_ids.add(record["episode_id"])
+        seen_hashes.add(record["signal_sha256"])
+        if len(accepted) >= quota:
+            reasons.append("quota_reached")
+        ok = ok and not reasons
         if ok:
             accepted.append(demo)
-        audit.append({"episode_id": demo.metadata["episode_id"], "accepted": ok,
-                      "reasons": reasons, "source_condition": demo.metadata.get("source_condition")})
+        audit.append({**record, "accepted": ok, "reasons": reasons,
+                      "candidate_order": len(audit),
+                      "accepted_index": len(accepted) - 1 if ok else None})
     weights = np.r_[np.full(len(original), config["skill"]["original_weight"]),
                     np.full(len(accepted), config["skill"]["new_weight"])]
     model = TPHSMM(config).fit(original + accepted, weights)
+    model.fit_manifest["refinement"] = {
+        "original_ids": [d.metadata["episode_id"] for d in original],
+        "accepted_ids": [d.metadata["episode_id"] for d in accepted],
+        "requested": quota, "accepted": len(accepted), "quota_met": len(accepted) == quota,
+        "eligibility": "first_unique_successes_in_supplied_acquisition_order",
+        "comparison_status": "eligible" if len(accepted) == quota else "diagnostic_only_incomplete_quota"}
     return model, audit, accepted

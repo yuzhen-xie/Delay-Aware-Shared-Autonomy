@@ -18,6 +18,8 @@ def main():
     for directory in directories:
         files.extend(p for p in (root / directory).rglob("*") if p.is_file()
                      and "__pycache__" not in p.parts and not p.name.endswith(".pyc")
+                     and not p.name.endswith(".local.yaml")
+                     and "local" not in p.relative_to(root).parts
                      and not any(part.endswith(".egg-info") for part in p.parts))
     files.extend(root / name for name in ("README.md", "pyproject.toml", "requirements.lock",
                                          "requirements-hardware.txt", ".gitignore"))

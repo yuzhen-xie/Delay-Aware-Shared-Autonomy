@@ -66,11 +66,9 @@ def write_csv(path: Path, keys, rows):
 
 
 def test_real_study_import_uses_participants_as_units_and_actual_tlx(config, tmp_path):
-    protocol = {k: "test_record" for k in ("approval_id", "ethics_body", "consent_procedure", "screening",
-                "recruitment", "experience_definition", "practice_trials", "analysis_plan_frozen_on")}
+    protocol = {"study_id": "unit-test-study", "analysis_plan_frozen_on": "2026-10-20"}
     (tmp_path / "protocol.yaml").write_text(yaml.safe_dump(protocol))
-    participants = [{"participant_id": f"T{i}", "age_years": 25 + i, "gender": "not_reported",
-                     "teleoperation_experience": "test_category", "consented": "true"} for i in range(2)]
+    participants = [{"participant_id": f"T{i}", "inclusion_status": "included"} for i in range(2)]
     write_csv(tmp_path / "participants.csv", participants[0].keys(), participants)
     rows, tlx = [], []
     for i in range(2):

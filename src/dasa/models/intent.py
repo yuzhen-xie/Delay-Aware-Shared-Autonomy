@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -91,6 +93,84 @@ def negative_elbo(action, predicted, mu, logvar):
     return nll, kl
 
 
+def objective_spec(config: dict) -> dict:
+    """Resolve the objective without inferring historical objectives from weights."""
+    c = config["intent"]
+    name = c.get("objective", "joint_elbo")
+    if name == "joint_elbo":
+        kl_weight, deviation_weight = 1.0, 1.0
+    elif name == "action_elbo":
+        kl_weight, deviation_weight = 1.0, 0.0
+    elif name == "legacy_weighted_auxiliary":
+        kl_weight = float(c["kl_weight"])
+        deviation_weight = (1.0 if c.get("deviation_objective") == "joint"
+                            else float(c["deviation_weight"]))
+        if not np.isfinite(kl_weight) or not np.isfinite(deviation_weight):
+            raise ValueError("Objective weights must be finite")
+        if kl_weight < 0 or deviation_weight < 0:
+            raise ValueError("Objective weights must be nonnegative")
+    else:
+        raise ValueError(f"Unknown intent objective: {name}")
+    return {"name": name, "kl_weight": kl_weight, "deviation_weight": deviation_weight,
+            "prior": "N(0,I)", "likelihood_variance": 1.0,
+            "gaussian_additive_constant_omitted": True,
+            "reduction": "sum feature coordinates; mean batch observations",
+            "standard_negative_elbo": name in {"joint_elbo", "action_elbo"}}
+
+
+def cvae_loss(action, predicted, deviation, predicted_deviation, mu, logvar, config: dict):
+    """Return the optimized tensor and separate, directly auditable components."""
+    action_nll, kl = negative_elbo(action, predicted, mu, logvar)
+    deviation_nll = 0.5 * (predicted_deviation - deviation).square().sum(-1).mean()
+    spec = objective_spec(config)
+    reconstruction = action_nll + spec["deviation_weight"] * deviation_nll
+    loss = reconstruction + spec["kl_weight"] * kl
+    return loss, {"action_nll": action_nll, "deviation_nll": deviation_nll,
+                  "reconstruction_nll": reconstruction, "kl_divergence": kl,
+                  "weighted_kl_divergence": spec["kl_weight"] * kl}
+
+
+def model_spec(config: dict) -> dict:
+    """Describe the concrete network and preprocessing saved with each training run."""
+    c = config["intent"]
+    hidden, latent = c["hidden_dim"], c["latent_dim"]
+    return {"action_dimension": ACTION_DIM, "deviation_dimension": GOALS,
+            "context_dimension": CONDITION_DIM, "goals": GOALS,
+            "encoder": [CONDITION_DIM + ACTION_DIM + GOALS, hidden, hidden],
+            "encoder_heads": {"mu": latent, "log_variance": latent},
+            "log_variance_clip": [-8.0, 6.0],
+            "decoder": [CONDITION_DIM + latent, hidden, hidden],
+            "decoder_heads": {"action": ACTION_DIM, "deviation": GOALS},
+            "goal_classifier": [CONDITION_DIM + latent, hidden, GOALS],
+            "hidden_activation": "SiLU", "classifier_output": "categorical logits",
+            "prior": "independent standard normal coordinates",
+            "initial_inference_latent": "zero prior mean; deterministic inference uses encoder mean",
+            "action_preprocessing": "unit raw force direction; zero force remains zero",
+            "context_preprocessing": "SI units; no dataset normalization or age feature",
+            "deviation_preprocessing": "three Euclidean distances to candidate unit references",
+            "classification_latent": "previous observation encoder mean; reset to zero per episode",
+            "lstm": {"input": CONDITION_DIM + ACTION_DIM, "hidden": hidden, "layers": 1},
+            "transformer": {"input": CONDITION_DIM + ACTION_DIM, "hidden": hidden,
+                            "heads": c["transformer_heads"], "layers": c["transformer_layers"],
+                            "feedforward": 2 * hidden, "activation": "ReLU", "dropout": 0.0,
+                            "causal_attention": True, "position_embedding_std": 0.02},
+            "sequence_window": c["sequence_window"]}
+
+
+def _arrays_digest(arrays: dict) -> dict:
+    """Hash the ordered values, dimensions and dtypes used for optimization."""
+    result = {}
+    for key in ("action", "deviation", "context", "label", "episode"):
+        value = np.ascontiguousarray(arrays[key])
+        digest = hashlib.sha256()
+        digest.update(str(value.dtype).encode())
+        digest.update(json.dumps(value.shape).encode())
+        digest.update(value.tobytes())
+        result[key] = {"sha256": digest.hexdigest(), "shape": list(value.shape),
+                       "dtype": str(value.dtype)}
+    return result
+
+
 class SequenceClassifier(nn.Module):
     def __init__(self, kind: str, config: dict):
         super().__init__()
@@ -163,28 +243,42 @@ def previous_latent(mu: torch.Tensor, episode: np.ndarray) -> torch.Tensor:
 
 def train_intent(config: dict, train: dict, validation: dict, output: Path) -> list[dict]:
     c = config["intent"]
+    spec = objective_spec(config)
+    if c["epochs"] < 1 or c["batch_size"] < 1:
+        raise ValueError("Training requires positive epochs and batch size")
+    for split in (train, validation):
+        if not len(split["label"]):
+            raise ValueError("Training and validation arrays must both be nonempty")
     output.mkdir(parents=True, exist_ok=True)
+    rng_state = torch.get_rng_state().numpy().tobytes()
+    rng_record = {"declared_run_seed": config["seed"], "torch_initial_seed": torch.initial_seed(),
+                  "torch_state_before_training_sha256": hashlib.sha256(rng_state).hexdigest()}
     model = ConditionalVAE(c["hidden_dim"], c["latent_dim"])
     optimizer = torch.optim.Adam(model.parameters(), lr=c["learning_rate"])
     tensors = {k: torch.from_numpy(train[k]) for k in ("action", "deviation", "context", "label")}
     history = []
     for epoch in range(c["epochs"]):
         model.train()
-        total, count = 0.0, 0
+        totals, count = {}, 0
         for ix in torch.randperm(len(train["label"])).split(c["batch_size"]):
             action, deviation, context = [tensors[k][ix] for k in ("action", "deviation", "context")]
             predicted, devhat, mu, logvar = model(action, deviation, context)
-            nll, kl = negative_elbo(action, predicted, mu, logvar)
-            auxiliary = 0.5 * (devhat - deviation).square().sum(-1).mean()
-            devweight = 1.0 if c["deviation_objective"] == "joint" else c["deviation_weight"]
-            loss = nll + c["kl_weight"] * kl + devweight * auxiliary
+            loss, components = cvae_loss(action, predicted, deviation, devhat, mu, logvar,
+                                         config)
+            if not torch.isfinite(loss):
+                raise ValueError("Nonfinite cVAE objective; check training observations")
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
-            total += float(loss.detach()) * len(ix)
+            for key, value in {"training_loss": loss, **components}.items():
+                totals[key] = totals.get(key, 0.0) + float(value.detach()) * len(ix)
             count += len(ix)
-        history.append({"model": "cvae", "epoch": epoch, "training_loss": total / count})
+        means = {key: total / count for key, total in totals.items()}
+        identity_error = (means["training_loss"] - means["reconstruction_nll"]
+                          - means["weighted_kl_divergence"])
+        history.append({"model": "cvae", "epoch": epoch, "objective": spec["name"],
+                        "objective_identity_error": identity_error, **means})
     model.eval()
     with torch.no_grad():
         mu, _ = model.encode(tensors["action"], tensors["deviation"], tensors["context"])
@@ -196,16 +290,20 @@ def train_intent(config: dict, train: dict, validation: dict, output: Path) -> l
         validation_mu, _ = model.encode(validation_t["action"], validation_t["deviation"], validation_t["context"])
         validation_previous = previous_latent(validation_mu, validation["episode"])
     for epoch in range(c["epochs"]):
+        training_total, training_count = 0.0, 0
         for ix in torch.randperm(len(train["label"])).split(c["batch_size"]):
             logits = model.classifier(torch.cat([previous[ix], tensors["context"][ix]], -1))
             loss = nn.functional.cross_entropy(logits, tensors["label"][ix])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            training_total += float(loss.detach()) * len(ix)
+            training_count += len(ix)
         with torch.no_grad():
             logits = model.classifier(torch.cat([validation_previous, validation_t["context"]], -1))
             val = float(nn.functional.cross_entropy(logits, validation_t["label"]))
-        history.append({"model": "goal_prior", "epoch": epoch, "validation_nll": val})
+        history.append({"model": "goal_prior", "epoch": epoch,
+                        "training_nll": training_total / training_count, "validation_nll": val})
         if val < best:
             best = val
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -219,20 +317,44 @@ def train_intent(config: dict, train: dict, validation: dict, output: Path) -> l
         best, best_state = np.inf, None
         for epoch in range(c["epochs"]):
             network.train()
+            training_total, training_count = 0.0, 0
             for ix in torch.randperm(len(x)).split(c["batch_size"]):
                 loss = nn.functional.cross_entropy(network(x[ix]), tensors["label"][ix])
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(network.parameters(), 5.0)
                 optimizer.step()
+                training_total += float(loss.detach()) * len(ix)
+                training_count += len(ix)
             network.eval()
             with torch.no_grad():
                 val = float(nn.functional.cross_entropy(network(xv), validation_t["label"]))
-            history.append({"model": kind, "epoch": epoch, "validation_nll": val})
+            history.append({"model": kind, "epoch": epoch,
+                            "training_nll": training_total / training_count,
+                            "validation_nll": val})
             if val < best:
                 best, best_state = val, {k: v.clone() for k, v in network.state_dict().items()}
         network.load_state_dict(best_state)
         torch.save(network.state_dict(), output / f"{kind}.pt")
+    metadata = {
+        "schema_version": 1, "objective": spec, "architecture": model_spec(config),
+        "torch_version": str(torch.__version__),
+        "randomness": rng_record, "intent_config": c,
+        "optimizer": {"name": "Adam", "learning_rate": c["learning_rate"],
+                      "betas": [0.9, 0.999], "epsilon": 1e-8, "weight_decay": 0.0,
+                      "cvae_gradient_norm_clip": 5.0, "sequence_gradient_norm_clip": 5.0,
+                      "classifier_gradient_norm_clip": None},
+        "epochs": c["epochs"], "batch_size": c["batch_size"],
+        "selection": {"cvae": "final training epoch", "goal_classifier": "validation NLL",
+                      "lstm": "validation NLL", "transformer": "validation NLL"},
+        "train_arrays": _arrays_digest(train), "validation_arrays": _arrays_digest(validation),
+        "train_episode_ids": sorted(set(train["episode"].tolist())),
+        "validation_episode_ids": sorted(set(validation["episode"].tolist())),
+        "checkpoint_sha256": {name: hashlib.sha256((output / f"{name}.pt").read_bytes()).hexdigest()
+                              for name in ("cvae", "lstm", "transformer")},
+        "history": history}
+    (output / "training-audit.json").write_text(json.dumps(metadata, indent=2, allow_nan=False),
+                                               encoding="utf-8")
     return history
 
 
@@ -283,9 +405,22 @@ class IntentEstimator:
 
 def load_models(config: dict, directory: Path):
     c = config["intent"]
+    audit_path = directory / "training-audit.json"
+    metadata = {"schema_version": 0, "objective": {"name": "unrecorded"}}
+    if audit_path.exists():
+        metadata = json.loads(audit_path.read_text(encoding="utf-8"))
+        for name in ("cvae", "lstm", "transformer"):
+            actual = hashlib.sha256((directory / f"{name}.pt").read_bytes()).hexdigest()
+            if actual != metadata["checkpoint_sha256"][name]:
+                raise ValueError(f"Checkpoint does not match training audit: {name}")
+        if metadata["architecture"] != model_spec(config):
+            raise ValueError("Network configuration does not match the training audit")
+        if metadata["objective"] != objective_spec(config):
+            raise ValueError("Objective configuration does not match the training audit")
     cvae = ConditionalVAE(c["hidden_dim"], c["latent_dim"])
     cvae.load_state_dict(torch.load(directory / "cvae.pt", weights_only=True, map_location="cpu"))
     cvae.eval()
+    cvae.training_metadata = metadata
     networks = {}
     for kind in ("lstm", "transformer"):
         model = SequenceClassifier(kind, config)

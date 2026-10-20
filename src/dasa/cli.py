@@ -12,9 +12,31 @@ def parser():
     p.add_argument("--config", default="configs/default.yaml")
     p.add_argument("--profile", help="YAML override merged into the base configuration")
     sub = p.add_subparsers(dest="command", required=True)
-    for command in ("prepare", "run", "intent", "sharing", "refinement", "stress", "report", "port-bench"):
+    for command in ("prepare", "run", "intent", "sharing", "refinement", "stress", "report", "port-bench",
+                    "figures", "protocol", "audit-run"):
         s = sub.add_parser(command)
         s.add_argument("--output", type=Path, default=Path("artifacts/run"))
+    s = sub.add_parser("scene-manifest")
+    s.add_argument("--output", type=Path, required=True)
+    s.add_argument("--count", type=int, default=100)
+    s.add_argument("--scenario", choices=["demonstrated", "novel", "wider", "extra_obstacles"], default="demonstrated")
+    s.add_argument("--seed", type=int)
+    s = sub.add_parser("perceive")
+    s.add_argument("rgbd", type=Path)
+    s.add_argument("specification", type=Path)
+    s.add_argument("--output", type=Path, required=True)
+    s = sub.add_parser("generalization")
+    s.add_argument("prepared", type=Path)
+    s.add_argument("candidates", type=Path)
+    s.add_argument("--scenes", type=Path)
+    s.add_argument("--output", type=Path, required=True)
+    s = sub.add_parser("validation-sweep")
+    s.add_argument("prepared", type=Path)
+    s.add_argument("--output", type=Path, required=True)
+    s.add_argument("--parameters", nargs="+")
+    s = sub.add_parser("intent-recordings")
+    s.add_argument("prepared", type=Path)
+    s.add_argument("--output", type=Path, required=True)
     s = sub.add_parser("video")
     s.add_argument("trial", type=Path)
     s.add_argument("--output", type=Path, default=Path("artifacts/replay.gif"))
@@ -64,7 +86,7 @@ def main():
     args = parser().parse_args()
     config = load_config(args.config, args.profile)
     seed_everything(config["seed"])
-    if args.command in {"prepare", "run", "train-data", "refine-data"} and args.output.exists() and any(args.output.iterdir()):
+    if args.command in {"prepare", "run", "train-data", "refine-data", "generalization", "validation-sweep", "intent-recordings"} and args.output.exists() and any(args.output.iterdir()):
         raise SystemExit("Output already contains data; use a new --output path to preserve the existing run")
     if args.command == "video":
         from dasa.reporting import video
@@ -103,6 +125,31 @@ def main():
     elif args.command == "report":
         from dasa.reporting import report
         report(config, args.output)
+    elif args.command == "figures":
+        from dasa.figures import build
+        result = build(config, args.output)
+        print(json.dumps(result, indent=2))
+    elif args.command == "protocol":
+        from dasa.reproducibility import export_protocol
+        export_protocol(config, args.output)
+    elif args.command == "audit-run":
+        from dasa.reproducibility import audit_run
+        print(json.dumps(audit_run(config, args.output), indent=2))
+    elif args.command == "scene-manifest":
+        from dasa.scenes import write_scene_manifest
+        write_scene_manifest(config, args.output, args.count, args.scenario, args.seed)
+    elif args.command == "perceive":
+        from dasa.robotics.perception import perceive_file
+        perceive_file(args.rgbd, args.specification, args.output)
+    elif args.command == "generalization":
+        from dasa.generalization import generalization
+        generalization(config, args.prepared, args.candidates, args.output, args.scenes)
+    elif args.command == "validation-sweep":
+        from dasa.tuning import sweep
+        sweep(config, args.prepared, args.output, args.parameters)
+    elif args.command == "intent-recordings":
+        from dasa.recorded import intent_recordings
+        intent_recordings(config, args.prepared, args.output)
     elif args.command == "port-bench":
         from dasa.portbench import run
         run(config, args.output)

@@ -69,6 +69,24 @@ def test_failed_demonstrations_are_rejected(config):
     assert not accepted and "contact_or_bounds" in reasons
 
 
+def test_recorded_geometry_and_boolean_outcomes_are_validated(config):
+    d = synthetic_demonstration(config, 1, "operator", "episode", 0)
+    d.metadata["success"] = "false"
+    with pytest.raises(ValueError, match="JSON boolean"):
+        d.validate()
+    d.metadata["success"] = False
+    d.scene.centers[0, 0] = np.nan
+    with pytest.raises(ValueError, match="scene geometry"):
+        d.validate()
+
+
+def test_demonstration_timeout_uses_elapsed_duration(config):
+    d = synthetic_demonstration(config, 1, "operator", "episode", 0)
+    d.time += 1000.0
+    _, reasons = successful(d, config)
+    assert "timeout" not in reasons
+
+
 def test_holm_correction_and_missing_values():
     corrected = holm([.01, .04, .03, None])
     assert np.allclose(corrected[:3], [.03, .06, .06])

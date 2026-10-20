@@ -1,0 +1,15 @@
+# C1-C4 is the prespecified comparison; guarded variants belong to a separate family.
+simulation:
+  feedback_delay: 0.8
+  command_delay: 0.0
+  jitter_seconds: 0.0
+experiments:
+  conditions: [C1, C2, C3, C4]
+  sharing_delays: [0.0, 0.4, 0.8, 1.5]
+  simulated_operators: 20
+  trials_per_condition: 2
+study:
+  participants: 20
+  trial_repeats: 1
+  practice_trials: 8
+  max_seconds: 60.0

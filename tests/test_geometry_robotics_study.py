@@ -62,8 +62,8 @@ def test_inverse_position_from_nearby_seed():
     assert np.linalg.norm(forward(fitted)[:3, 3] - target) < 1e-5
 
 
-def test_absent_actual_approval_record_prevents_human_analysis():
-    with pytest.raises(ValueError, match="approval_id"):
+def test_absent_analysis_contract_prevents_human_analysis():
+    with pytest.raises(ValueError, match="study_id"):
         validate_protocol({}, [])
 
 
@@ -71,7 +71,7 @@ def test_study_schedule_has_every_condition_for_every_participant(config, tmp_pa
     output = tmp_path / "schedule.csv"
     write_schedule(config, output)
     rows = read_csv(output)
-    assert len(rows) == 12 * 4 * 4
+    assert len(rows) == 20 * 4 * 4
     for participant in {r["participant_id"] for r in rows}:
         selected = [r for r in rows if r["participant_id"] == participant]
         assert len({(r["condition"], r["delay_seconds"]) for r in selected}) == 16

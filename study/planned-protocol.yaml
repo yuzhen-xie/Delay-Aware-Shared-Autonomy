@@ -1,0 +1,47 @@
+schema_version: 1
+status: prospective_design_not_a_historical_record
+registration:
+  planned_participants: 20
+  fields: [participant_id, inclusion_status]
+  allowed_status: [included, excluded, withdrawn]
+session:
+  briefing_minutes: 10
+  practice_trials: 8
+  practice_max_trial_seconds: 60
+  practice_sequence: [[C1, 0.0], [C1, 0.0], [C1, 0.4], [C1, 0.8], [C3, 0.0], [C3, 0.4], [C3, 0.8], [C3, 0.8]]
+  readiness: understands_goal_selection_grasp_place_stop_and_delayed_feedback; two_final_practice_trials_completed_without_collision
+  practice_extra: at_most_4_additional_trials; record_reasons_duration_and_outcomes; if_not_ready_exclude_before_randomization
+  conditions: [C1, C2, C3, C4]
+  feedback_delays_seconds: [0.0, 0.4, 0.8, 1.5]
+  command_delay_seconds: 0.0
+  experimental_trials_per_cell: 1
+  trial_timeout_seconds: 60
+  rest_after_trials: 4
+  rest_minutes: 2
+  optional_extra_rest: always_available_and_recorded
+  workload_measurement: after_each_condition_at_0.8_seconds_feedback_delay
+  workload_rating_minutes_budget: 1
+  debrief_minutes: 5
+  expected_session_minutes: [40, 60]
+randomization:
+  method: seed_permuted_cell_labels_with_Williams_sequences
+  seed: 20261014
+  balancing_limit: 20_participants_cannot_exactly_balance_16_distinct_sequences; report_actual_order_and_carryover_counts
+  scene_matching: same_participant_delay_repeat_same_scene_and_goal_across_C1_to_C4
+analysis:
+  freeze_before_collection: true
+  sample_size_status: feasibility_cohort_not_a_confirmatory_power_calculation
+  outcomes: [success_rate, successful_completion_seconds, minimum_clearance_m, jerk_rms, timeout_penalized_seconds]
+  analysis_unit: participant
+  repeated_trials: average_within_participant_condition_delay
+  comparisons: C3_vs_C1_C2_C4_at_each_declared_delay
+  task_family: 3_comparisons_times_4_delays_times_5_outcomes
+  workload_family: 3_comparisons_times_7_scales_at_0.8_seconds
+  test: two_sided_paired_sign_permutation
+  assumptions: independent_participants_and_sign_exchangeable_paired_differences_under_null
+  correction: Holm_FWER_0.05_per_declared_family
+  confidence_intervals: 5000_paired_participant_percentile_bootstrap_pointwise_95_percent
+  permutation_samples_for_n_above_18: 20000
+  effect_sizes: raw_mean_difference_and_Cohen_dz_with_bootstrap_CI_when_defined
+  missingness: no_imputation; paired_complete_cells_per_contrast; report_cell_counts_and_all_exclusions
+  failures: success_zero; successful_completion_time_missing; timeout_penalized_time_equals_timeout

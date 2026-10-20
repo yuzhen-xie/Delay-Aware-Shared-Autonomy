@@ -1,0 +1,11 @@
+# Full declared simulation budget; does not supply measured demonstration data.
+intent:
+  objective: joint_elbo
+  kl_weight: 1.0
+  deviation_weight: 1.0
+  epochs: 35
+experiments:
+  intent_delays: [0.0, 0.4, 0.8, 1.5]
+  bootstrap_demonstrations: 20
+  validation_demonstrations: 6
+  test_demonstrations: 12

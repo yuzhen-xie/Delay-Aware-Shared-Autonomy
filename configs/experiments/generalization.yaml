@@ -1,0 +1,8 @@
+# Prospective transfer tests. Counts are requested budgets, never presumed successful data.
+skill:
+  refinement_count: 20
+experiments:
+  independent_repeats: 10
+  autonomy_trials: 100
+  scenarios: [demonstrated, novel, wider, extra_obstacles]
+  refinement_budgets: [0, 5, 10, 20]

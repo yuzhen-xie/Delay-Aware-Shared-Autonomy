@@ -174,6 +174,8 @@ def report(config: dict, root: Path):
     sharing = load_rows(root / "sharing/metrics.json")
     intent = load_rows(root / "intent/metrics.json")
     refinement = load_rows(root / "refinement/metrics.json")
+    from dasa.figures import build, eligible
+    complete_refinement = [row for row in refinement if eligible(row)]
     figures = []
     if sharing:
         for key, label in (("success_rate", "Task success fraction"),
@@ -193,12 +195,13 @@ def report(config: dict, root: Path):
     tables = {
         "sharing": summary(sharing, ["success_rate", "completion_seconds", "minimum_clearance_m"]),
         "intent": summary(intent, ["accuracy", "ipa", "nll"]),
-        "refinement": summary(refinement, ["success_rate", "reference_error_m"])}
+        "refinement": summary(complete_refinement, ["success_rate", "reference_error_m"])}
     write_json(directory / "summary.json", tables)
     budgets = load_rows(root / "refinement/budgets.json")
     outstanding = [b for b in budgets if not b["quota_met"]]
     limitation = (f"{len(outstanding)} refinement cells did not meet the demonstration quota. "
                   "Their evaluations are diagnostic and cannot support the specified fixed-budget comparison.")
+    build(config, root)
     images = "".join(f"<figure><img src='{name}' alt='{name}'><figcaption>{name}</figcaption></figure>"
                      for name in figures)
     sections = "".join(f"<h2>{name}</h2>{html_table(rows)}" for name, rows in tables.items())
@@ -209,6 +212,9 @@ def report(config: dict, root: Path):
     <h1>Delayed shared control: run report</h1>
     <p class='notice'>Synthetic task-space simulation. Physical device measurements and questionnaire responses
     are separate data sources. {limitation}</p>
+    <p><a href='../figures/manifest.json'>Figure exports, input hashes and metric definitions</a>;
+    PNG, PDF, SVG and unit-level CSV tables are in the adjacent figures directory.
+    Incomplete refinement cells are excluded from comparative learning summaries.</p>
     <p>Completion times condition on success; failed trials retain elapsed time and failure outcomes.
     Figures show unit-level means and standard errors, without untested significance markers.
     Raw and Holm-adjusted p values, paired confidence intervals, effects and sample sizes are in the

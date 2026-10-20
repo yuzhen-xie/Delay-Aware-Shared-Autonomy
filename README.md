@@ -34,6 +34,27 @@ Open the generated `report/index.html`. Each run uses a new output directory.
 The complete experiment configuration is `configs/default.yaml`; `smoke.yaml`
 reduces the training and evaluation budget for an installation check.
 
+## Experiment specification
+
+Read [实验实施与数据记录细则](docs/experiment-details.md) for the complete operational
+definitions and [figure recipes](docs/figure-recipes.md) for Fig. 5, Fig. 6,
+Fig. 8 and learning commands. Supporting specifications cover the
+[actual training objective and architectures](docs/intent-model.md),
+[demonstration selection and weighted refitting](docs/skill-refinement.md),
+[RGB-D geometry and frozen scene manifests](docs/perception-scenes.md),
+[anonymous study procedure and statistical analysis](docs/human-study.md),
+[validation-only sensitivity experiments](docs/tuning.md) and
+[default values with units](docs/parameters.md).
+
+[Implementation validation](docs/validation.md) records the executed checks and
+observed simulation failures, including incomplete demonstration budgets.
+
+The reference cVAE optimizes `reconstruction_nll + kl_divergence` with unit
+weights and records both terms in a checkpoint-bound training audit. The explicitly
+named `legacy_objective.yaml` profile preserves the earlier weighted objective.
+Default values and prospective protocols describe this implementation; measured
+outcomes come from recorded data. Generated examples are labeled synthetic.
+
 ## Components
 
 - Timestamped feedback and command channels, measured packet age, delay jitter and stale-packet handling.
@@ -55,7 +76,11 @@ dasa --profile configs/smoke.yaml refinement --output artifacts/staged
 dasa --profile configs/smoke.yaml stress --output artifacts/staged
 dasa --profile configs/smoke.yaml port-bench --output artifacts/staged/ports
 dasa --profile configs/smoke.yaml report --output artifacts/staged
+dasa --profile configs/smoke.yaml figures --output artifacts/staged
+dasa --profile configs/smoke.yaml audit-run --output artifacts/staged
 dasa validate-data artifacts/staged/dataset
+dasa protocol --output artifacts/specification
+dasa scene-manifest --scenario wider --count 100 --output artifacts/scenes/wider.json
 ```
 
 Run `dasa run --output artifacts/full` for the complete configured budget. All
@@ -67,8 +92,25 @@ in a `splits.json` file. Train and update them with:
 
 ```bash
 dasa train-data data/processed --output artifacts/measured
+dasa intent-recordings artifacts/measured --output artifacts/recorded-intent
 dasa refine-data data/processed data/raw/new_demos --output artifacts/updated
 ```
+
+Training snapshots the declared dataset into the new run directory. Budget and
+generalization experiments consume ordered collections, preserve failed attempts,
+and evaluate bootstrap-only and first-success-prefix policies on shared frozen scenes:
+
+```bash
+dasa --profile configs/experiments/generalization.yaml generalization artifacts/measured data/collections --output artifacts/measured/generalization
+dasa --profile configs/experiments/sensitivity.yaml validation-sweep artifacts/measured --output artifacts/sensitivity
+dasa --profile configs/experiments/generalization.yaml figures --output artifacts/measured
+dasa study-schedule --output artifacts/study/schedule.csv
+```
+
+Unmet successful-demonstration budgets are excluded from fixed-budget comparisons.
+Statistical exports include paired-unit effects and confidence intervals, raw p
+values, Holm adjustment, multiplicity families and missingness. Anonymous study
+and NASA-TLX imports consume recorded CSV data; no questionnaire data are generated.
 
 ## Device integration
 

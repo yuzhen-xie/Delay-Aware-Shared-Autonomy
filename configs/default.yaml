@@ -29,17 +29,21 @@ scene:
   training_translation: 0.025
   novel_translation: [0.05, 0.15]
   added_obstacle_radius: 0.055
+  object_size_m: [0.04, 0.04, 0.06]
 motion:
   attractive_gain: 22.0
   repulsive_gain: 0.20
   repulsive_sigma: 0.11
   repulsive_limit: 8.0
+  attractive_weight: 1.0
+  repulsive_weight: 1.0
   distance_min: 0.08
   distance_max: 0.25
   lambda_gain: 10.0
   risk_distance: center
   kalman_process: 0.08
   kalman_measurement: 0.8
+  kalman_initial_variance: 1.0
 arbitration:
   stiffness: 28.0
   damping: 5.0
@@ -51,6 +55,8 @@ arbitration:
   low_confidence_threshold: 0.12
   correction_distance: 0.12
   rho_window_seconds: 1.0
+  fixed_weight: 0.5
+  guarded_corrective_max: 0.15
 passivity:
   initial_energy: 1.0
   maximum_energy: 8.0
@@ -69,9 +75,10 @@ intent:
   batch_size: 256
   epochs: 35
   learning_rate: 0.001
-  kl_weight: 0.05
-  deviation_weight: 0.2
-  deviation_objective: auxiliary
+  objective: joint_elbo
+  kl_weight: 1.0
+  deviation_weight: 1.0
+  deviation_objective: joint
 skill:
   states: 7
   trajectory_samples: 140
@@ -82,6 +89,22 @@ skill:
   original_weight: 1.0
   new_weight: 1.0
   refinement_count: 20
+  online_filter: false
+  goal_search_fraction: 0.60
+  goal_index_floor: 4
+  lift_segment_fraction: 0.22
+  lookahead_samples: 5
+  progress_advance_samples: 3
+  proximity_threshold_m: 0.035
+  goal_snap_samples: 4
+  place_snap_samples: 9
+  place_snap_distance_m: 0.05
+bootstrap:
+  segment_min_seconds: 0.45
+  cruise_speed_m_s: [0.16, 0.24]
+  minimum_segment_samples: 12
+  lateral_std_m: 0.008
+  force_noise_std_N: 0.15
 operator:
   kp: 26.0
   kd: 7.0
@@ -103,3 +126,9 @@ experiments:
   bootstrap_samples: 5000
   permutation_samples: 20000
   port_bench_steps: 20000
+  refinement_budgets: [0, 5, 10, 20]
+study:
+  participants: 20
+  trial_repeats: 1
+  practice_trials: 8
+  max_seconds: 60.0
