@@ -12,11 +12,11 @@ powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1 -Hardware
 dasa --profile configs/smoke.yaml run --output artifacts/check
 ```
 
-On Linux, run `bash scripts/setup.sh`, then `source /workspace/.venvs/dasa/bin/activate`. Use `configs/default.yaml` for the full experimental budget or profiles under `configs/experiments/` for individual experiments. Trajectories, models, statistics and figures are saved in the selected output directory.
+On Linux, run `bash scripts/setup.sh`, then `source /workspace/.venvs/dasa/bin/activate`. Use `configs/default.yaml` for the full experimental budget or profiles under `configs/experiments/` for individual experiments. 
 
 ## Hardware experiments
 
-Supply the actual controller address through `--host`. Calibration, camera intrinsics and scene geometry must come from measured inputs. Generate the hardware configuration first:
+Supply the actual controller address through `--host`. Generate the hardware configuration first:
 
 ```bash
 dasa calibrate data/raw/landmarks.json --output data/raw/calibration.json
@@ -46,7 +46,7 @@ dasa hardware-trial artifacts/study/schedule.csv --participant P01 --trial-id P0
 
 Without `--execute`, the workstation only records measurements. Use `robot-session` for standalone acquisition and `--skill` to select a refined model. Hardware control uses translational velocity commands with held tool orientation, speed limits, feedback acknowledgement, clearance checks and watchdogs. The measured scene must match the selected trial. Software tests do not establish physical hardware validation.
 
-Collect initial zero-delay demonstrations with `dasa robot-session --hardware configs/ur10.local.yaml --condition C1 --output data/raw/bootstrap-001.json --execute`; no pretrained model is required. Include successful bootstrap demonstrations for every candidate goal. Scheduled trials use their assigned delays.
+Collect initial zero-delay demonstrations with `dasa robot-session --hardware configs/ur10.local.yaml --condition C1 --output data/raw/bootstrap-001.json --execute`; no pretrained model is required. 
 
 ## Data, training and analysis
 
