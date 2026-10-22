@@ -1,8 +1,9 @@
 tuning:
   split: validation
-  primary_metric: success_rate
-  tie_breakers: [minimum_clearance_m, completion_seconds]
-  grids:
+  primary_metric: timeout_penalized_seconds
+  selection_criterion: minimum_mean_timeout_penalized_seconds
+  tie_break: candidate_id_lexicographic
+  grid:
     intent.beta: [1.0, 3.0, 5.0]
     motion.lambda_gain: [5.0, 10.0, 20.0]
     motion.distance_min: [0.06, 0.08, 0.10]

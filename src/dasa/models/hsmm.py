@@ -36,6 +36,8 @@ def demonstration_fingerprint(demo: Demonstration) -> dict:
             "operator_id": demo.metadata["operator_id"],
             "provenance": demo.metadata["provenance"],
             "source_condition": demo.metadata.get("source_condition"),
+            "source_recording_sha256": demo.metadata["source_recording_sha256"],
+            "acquisition_started_utc": demo.metadata.get("acquisition_started_utc"),
             "goal": int(demo.goal), "samples": len(demo.time),
             "duration_seconds": float(demo.time[-1] - demo.time[0]),
             "signal_sha256": signal_hash,
@@ -137,6 +139,10 @@ class TPHSMM:
     def fit(self, demos: list[Demonstration], weights: np.ndarray | None = None) -> "TPHSMM":
         if not demos:
             raise ValueError("TP-HSMM needs complete demonstrations")
+        if any(d.metadata.get("provenance") != "UR10_measured_teleoperation" for d in demos):
+            raise ValueError("TP-HSMM fitting requires imported physical demonstrations")
+        if any(not successful(demo, self.config)[0] for demo in demos):
+            raise ValueError("TP-HSMM fitting admits only complete successful physical demonstrations")
         ids = [d.metadata["episode_id"] for d in demos]
         if len(set(ids)) != len(ids):
             raise ValueError("Duplicated demonstrations would change the empirical weights")
@@ -235,29 +241,44 @@ class TPHSMM:
         sequence = self.state_sequence(scene, goal)
         target, covariance = means[sequence], covariances[sequence]
         dt = self.duration_seconds / (self.samples - 1)
+        states = self.lqt(target, covariance, np.r_[scene.start, np.zeros(3)], dt)
+        return states[:, :3], covariance
+
+    def lqt(self, target: np.ndarray, covariance: np.ndarray,
+            initial_state: np.ndarray, dt: float) -> np.ndarray:
+        target = np.asarray(target, float)
+        covariance = np.asarray(covariance, float)
+        initial_state = np.asarray(initial_state, float)
+        horizon = len(target)
+        if (horizon < 2 or target.shape != (horizon, 3)
+                or covariance.shape != (horizon, 3, 3) or initial_state.shape != (6,)
+                or not np.isfinite(np.r_[target.ravel(), covariance.ravel(), initial_state, dt]).all()
+                or dt <= 0 or np.linalg.eigvalsh(covariance).min() <= 0):
+            raise ValueError("LQT requires finite position distributions, a six-dimensional state and a positive step")
         a = np.block([[np.eye(3), dt * np.eye(3)], [np.zeros((3, 3)), np.eye(3)]])
         b = np.vstack([0.5 * dt**2 * np.eye(3), dt * np.eye(3)])
         r = np.eye(3) * self.config["skill"]["lqt_control_cost"]
         gains, feedforward = [], []
-        p, q = np.zeros((6, 6)), np.zeros(6)
-        for t in reversed(range(self.samples)):
-            cost = np.zeros((6, 6))
-            cost[:3, :3] = np.linalg.inv(covariance[t])
-            state_target = np.r_[target[t], np.zeros(3)]
-            p += cost
-            q -= cost @ state_target
+        costs = np.zeros((horizon, 6, 6))
+        costs[:, :3, :3] = np.linalg.inv(covariance)
+        targets = np.column_stack([target, np.zeros_like(target)])
+        p, q = costs[-1].copy(), -costs[-1] @ targets[-1]
+        for t in reversed(range(horizon - 1)):
             h = r + b.T @ p @ b
             gain, offset = np.linalg.solve(h, b.T @ p @ a), np.linalg.solve(h, b.T @ q)
             gains.append(gain)
             feedforward.append(offset)
-            p, q = a.T @ p @ a - a.T @ p @ b @ gain, a.T @ q - a.T @ p @ b @ offset
-        state, path = np.r_[scene.start, np.zeros(3)], []
+            p, q = (costs[t] + a.T @ p @ a - a.T @ p @ b @ gain,
+                    -costs[t] @ targets[t] + a.T @ q - a.T @ p @ b @ offset)
+        state, path = initial_state.copy(), [initial_state.copy()]
         for gain, offset in zip(reversed(gains), reversed(feedforward)):
-            path.append(state[:3].copy())
             state = a @ state + b @ (-gain @ state - offset)
-        return np.array(path), covariance
+            path.append(state.copy())
+        return np.array(path)
 
     def save(self, path: Path) -> None:
+        if not self.fit_manifest.get("available"):
+            raise ValueError("An unfitted TP-HSMM cannot become a deployable physical checkpoint")
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, means=self.means, covariances=self.covariances,
                             duration_mean=self.duration_mean, duration_std=self.duration_std,
@@ -278,32 +299,43 @@ class TPHSMM:
             model.fit_ids = d["fit_ids"].tolist()
             model.fit_manifest = json.loads(str(d["fit_manifest"])) if "fit_manifest" in d else {
                 "available": False, "reason": "legacy_checkpoint_missing_training_records"}
+            records = model.fit_manifest.get("records", [])
+            if (not model.fit_manifest.get("available") or not records
+                    or any(record.get("provenance") != "UR10_measured_teleoperation" for record in records)):
+                raise ValueError("Physical deployment requires an audited checkpoint fitted from measured demonstrations")
             if model.fit_manifest.get("available") and model.fit_manifest["trajectory_samples"] != model.samples:
                 raise ValueError("TP-HSMM checkpoint trajectory horizon does not match configuration")
+            if (model.duration_mean.shape != (model.k,) or model.duration_std.shape != (model.k,)
+                    or not np.isfinite(np.r_[model.means.ravel(), model.covariances.ravel(),
+                                            model.duration_mean, model.duration_std, model.duration_seconds]).all()
+                    or np.any(model.duration_mean <= 0) or np.any(model.duration_std <= 0)
+                    or model.duration_seconds <= 0 or np.linalg.eigvalsh(model.covariances).min() <= 0):
+                raise ValueError("The measured skill checkpoint has invalid emissions or physical durations")
         return model
 
 
-def refine(config: dict, original: list[Demonstration], candidates: list[Demonstration]):
-
-
-
-
-
-
+def select_demonstrations(config: dict, original: list[Demonstration], candidates: list[Demonstration]):
     accepted, audit = [], []
     quota = config["skill"]["refinement_count"]
     if not isinstance(quota, int) or quota < 0:
         raise ValueError("refinement_count must be a nonnegative integer")
+    if any(d.metadata.get("provenance") != "UR10_measured_teleoperation"
+           for d in original + candidates):
+        raise ValueError("Skill refinement requires imported physical demonstrations")
     seen_ids = {d.metadata["episode_id"] for d in original}
     seen_hashes = {demonstration_fingerprint(d)["signal_sha256"] for d in original}
+    seen_recordings = {d.metadata["source_recording_sha256"] for d in original}
     for demo in candidates:
         record = demonstration_fingerprint(demo)
         ok, reasons = successful(demo, config)
         reasons = list(reasons)
         if record["episode_id"] in seen_ids or record["signal_sha256"] in seen_hashes:
             reasons.append("duplicate_or_original_overlap")
+        if record["source_recording_sha256"] in seen_recordings:
+            reasons.append("duplicate_or_original_recording")
         seen_ids.add(record["episode_id"])
         seen_hashes.add(record["signal_sha256"])
+        seen_recordings.add(record["source_recording_sha256"])
         if len(accepted) >= quota:
             reasons.append("quota_reached")
         ok = ok and not reasons
@@ -312,6 +344,14 @@ def refine(config: dict, original: list[Demonstration], candidates: list[Demonst
         audit.append({**record, "accepted": ok, "reasons": reasons,
                       "candidate_order": len(audit),
                       "accepted_index": len(accepted) - 1 if ok else None})
+    return accepted, audit
+
+
+def refine(config: dict, original: list[Demonstration], candidates: list[Demonstration]):
+    accepted, audit = select_demonstrations(config, original, candidates)
+    quota = config["skill"]["refinement_count"]
+    if len(accepted) != quota:
+        raise ValueError(f"A fixed-budget refinement requires {quota} successful physical demonstrations; found {len(accepted)}")
     weights = np.r_[np.full(len(original), config["skill"]["original_weight"]),
                     np.full(len(accepted), config["skill"]["new_weight"])]
     model = TPHSMM(config).fit(original + accepted, weights)
@@ -320,5 +360,5 @@ def refine(config: dict, original: list[Demonstration], candidates: list[Demonst
         "accepted_ids": [d.metadata["episode_id"] for d in accepted],
         "requested": quota, "accepted": len(accepted), "quota_met": len(accepted) == quota,
         "eligibility": "first_unique_successes_in_supplied_acquisition_order",
-        "comparison_status": "eligible" if len(accepted) == quota else "diagnostic_only_incomplete_quota"}
+        "comparison_status": "eligible"}
     return model, audit, accepted

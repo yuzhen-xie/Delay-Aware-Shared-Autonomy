@@ -8,12 +8,12 @@ from pathlib import Path
 import numpy as np
 
 from dasa.config import write_json
-from dasa.geometry import Scene, make_scene, waypoints
+from dasa.geometry import Scene, make_scene
 
 
 SCENARIOS = ("demonstrated", "novel", "wider", "extra_obstacles")
-SCHEMA_VERSION = 1
-GENERATOR_VERSION = "constrained_translation_v1"
+SCHEMA_VERSION = 2
+GENERATOR_VERSION = "radial_physical_layout_v2"
 
 
 @dataclass(frozen=True)
@@ -23,7 +23,6 @@ class SceneConstraints:
     object_size_m: tuple[float, float, float] = (0.04, 0.04, 0.06)
     separation_margin_m: float = 0.005
     maximum_base_radius_m: float = 1.1
-    check_nominal_paths: bool = True
     maximum_attempts: int = 1000
 
     def validate(self) -> None:
@@ -65,13 +64,13 @@ def validate_scene(scene: Scene, config: dict,
         failures.append("frame_not_base")
     if len(set(scene.obstacle_ids)) != len(scene.obstacle_ids) or np.any(r <= 0):
         failures.append("invalid_obstacles")
-    sim = config["simulation"]
-    lower, upper = np.asarray(sim["workspace_min"]), np.asarray(sim["workspace_max"])
+    task = config["task"]
+    lower, upper = np.asarray(task["workspace_min"]), np.asarray(task["workspace_max"])
     if lower.shape != (3,) or upper.shape != (3,) or np.any(lower >= upper):
         raise ValueError("Workspace bounds must be ordered 3D vectors")
     object_radius = float(np.linalg.norm(constraints.object_size_m) / 2)
     margin = constraints.separation_margin_m
-    tcp_radius = float(sim["robot_radius"])
+    tcp_radius = float(task["robot_radius"])
     task_points = np.vstack([g, scene.start, scene.place])
     task_radii = np.array([max(object_radius, tcp_radius)] * 3
                          + [tcp_radius, max(object_radius, tcp_radius)])
@@ -93,14 +92,6 @@ def validate_scene(scene: Scene, config: dict,
         pairs = np.triu_indices(len(o), k=1)
         if np.any(obstacle_distances[pairs] <= (r[:, None] + r[None] + margin)[pairs]):
             failures.append("overlapping_obstacles")
-    if constraints.check_nominal_paths and len(o):
-        for goal in range(3):
-            path = waypoints(scene, goal, sim["lift_height"])
-            if np.any(path - tcp_radius < lower) or np.any(path + tcp_radius > upper):
-                failures.append(f"nominal_path_{goal}_outside_workspace")
-            if any(scene.swept_clearance(a, b, tcp_radius) <= margin
-                   for a, b in zip(path[:-1], path[1:])):
-                failures.append(f"nominal_path_{goal}_blocked")
     return failures
 
 
@@ -134,15 +125,17 @@ def generate_manifest(config: dict, count: int, scenario: str = "demonstrated",
         else:
             raise ValueError(f"No feasible scene at index {index} after "
                              f"{constraints.maximum_attempts} attempts: {attempts[-1]['failures']}")
-    generation_config = {"scene": config["scene"], "simulation": {
-        key: config["simulation"][key] for key in (
+    generation_config = {"scene": config["scene"], "task": {
+        key: config["task"][key] for key in (
             "workspace_min", "workspace_max", "robot_radius", "lift_height")}}
     constraint_values = asdict(constraints)
     constraint_values["object_size_m"] = list(constraints.object_size_m)
     result = {"schema_version": SCHEMA_VERSION, "generator_version": GENERATOR_VERSION,
               "numpy_version": np.__version__, "master_seed": seed, "scenario": scenario,
               "coordinate_frame": "base", "length_unit": "metre",
-              "geometry_status": "declared_benchmark_geometry_not_hardware_measurements",
+              "geometry_status": "prospective_layout_requires_physical_placement_and_measured_confirmation",
+              "target_perturbation": "uniform_radius_and_angle_in_base_xy; no_coordinate_clipping",
+              "path_selection": "no_nominal_path_feasibility_filter",
               "object_envelope": "axis_aligned_box_centered_on_candidate_grasp_position",
               "constraints": constraint_values, "generation_config": generation_config,
               "generation_config_sha256": _digest(generation_config), "scenes": entries}

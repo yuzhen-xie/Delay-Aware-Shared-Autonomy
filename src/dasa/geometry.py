@@ -22,7 +22,7 @@ class Scene:
     centers: np.ndarray
     radii: np.ndarray
     obstacle_ids: list[str]
-    provenance: str = "known_scene_simulation"
+    provenance: str = "planned_physical_layout"
     frame: str = "base"
 
     def clearance(self, position: np.ndarray, robot_radius: float) -> np.ndarray:
@@ -54,31 +54,24 @@ def make_scene(config: dict, rng: np.random.Generator, scenario: str = "demonstr
     centers = np.array([o["center"] for o in c["obstacles"]], dtype=float)
     radii = np.array([o["radius"] for o in c["obstacles"]])
     ids = [o["id"] for o in c["obstacles"]]
-    span = c["training_translation"]
-    translation = rng.uniform(-span, span, 3)
-    translation[2] *= 0.25
-    goals, place, start, centers = [x + translation for x in (goals, place, start, centers)]
+    if scenario not in {"demonstrated", "novel", "wider", "extra_obstacles"}:
+        raise ValueError("Unknown physical scene condition")
     if scenario != "demonstrated":
         low, high = c["novel_translation"]
         scale = 1.6 if scenario == "wider" else 1.0
-        shift = rng.uniform(low, high, (3, 2)) * rng.choice([-1, 1], (3, 2)) * scale
-        goals[:, :2] += shift
-        goals[:, :2] = np.clip(goals[:, :2], [0.30, -0.42], [0.78, 0.42])
-        new_centers = [[0.49, -0.12, 0.31]]
-        if scenario == "extra_obstacles":
-            new_centers += [[0.68, 0.14, 0.34], [0.29, 0.12, 0.28]]
-        centers = np.vstack([centers, np.asarray(new_centers) + translation])
-        radii = np.r_[radii, [c["added_obstacle_radius"]] * len(new_centers)]
-        ids += [f"novel_{i}" for i in range(len(new_centers))]
-    return Scene(goals, place, start, centers, radii, ids, c["provenance"], c["frame"])
-
-
-def waypoints(scene: Scene, goal: int, lift: float) -> np.ndarray:
-    target = scene.goals[goal]
-    return np.array([scene.start, [scene.start[0], scene.start[1], lift],
-                     [target[0], target[1], lift], target,
-                     [target[0], target[1], lift], [scene.place[0], scene.place[1], lift],
-                     scene.place])
+        distance = rng.uniform(low, high, 3) * scale
+        angle = rng.uniform(-np.pi, np.pi, 3)
+        goals[:, :2] += distance[:, None] * np.column_stack([np.cos(angle), np.sin(angle)])
+        added = 3 if scenario == "extra_obstacles" else 1
+        new_centers = []
+        for _ in range(added):
+            goal = int(rng.integers(0, 3))
+            fraction = rng.uniform(.3, .7)
+            new_centers.append(start + fraction * (goals[goal] - start) + rng.normal(0, .04, 3))
+        centers = np.vstack([centers, np.asarray(new_centers)])
+        radii = np.r_[radii, [c["added_obstacle_radius"]] * added]
+        ids += [f"novel_{i}" for i in range(added)]
+    return Scene(goals, place, start, centers, radii, ids, "planned_physical_layout", c["frame"])
 
 
 def task_frames(scene: Scene, goal: int) -> tuple[np.ndarray, np.ndarray]:

@@ -37,7 +37,7 @@ class Confidence:
         autonomous = float(np.clip((c["covariance_upper"] - trace) /
                                    (c["covariance_upper"] - c["covariance_lower"]), 0, 1))
         self.derivatives.append(np.linalg.norm(human_force - self.previous) /
-                                self.config["simulation"]["decision_dt"])
+                                self.config["task"]["decision_dt"])
         self.previous = human_force.copy()
         roughness = float(np.mean(self.derivatives))
         human = (1 - rho) * np.exp(-c["roughness_gamma"] * roughness)

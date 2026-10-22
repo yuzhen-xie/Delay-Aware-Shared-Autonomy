@@ -118,9 +118,11 @@ def _matched_scene(rows, assignment, tolerance):
     if assignment["scene_seed"] is None:
         return {"matched_acquisition_ids": [], "maximum_geometry_difference_m": None}
     for event in rows:
+        same_layout_group = bool(assignment.get("layout_group")) and event.get("layout_group") == assignment["layout_group"]
+        same_person_seed = (event.get("participant_id") == assignment["participant_id"]
+                            and event.get("scene_seed") == assignment["scene_seed"])
         if (event.get("event") != "recorded" or not event.get("execute")
-                or event.get("participant_id") != assignment["participant_id"]
-                or event.get("scene_seed") != assignment["scene_seed"]):
+                or not (same_layout_group or same_person_seed)):
             continue
         difference = _scene_delta(event["scene"], assignment["scene"])
         if difference > tolerance:
@@ -157,11 +159,23 @@ def _validate_recording(recording, assignment, execute):
     return len(samples), any(sample.get("executed") is True for sample in samples)
 
 
+def _recording_assignment(assignment, common):
+    fields = ("trial_id", "participant_id", "intended_goal", "scene_seed", "scene_id", "acquisition_id",
+              "practice", "planned_order", "timeout_seconds", "robot_radius_m", "stage", "policy_sha256",
+              "training_repeat", "training_condition", "refinement_budget", "scenario", "layout_group",
+              "candidate_id", "candidate_config_sha256", "config_sha256", "schedule_sha256",
+              "actor_type", "evaluation_index", "matched_block_id", "matched_block_index",
+              "within_block_order", "randomization_seed")
+    return {**{key: assignment[key] for key in fields if key in assignment},
+            "assignment_sha256": common.get("assignment_sha256")}
+
+
 def run_experiment(config, schedule_csv, hardware_path, models, output, execute=False,
                    participant=None, trial_id=None, skill_path=None):
     if not isinstance(execute, bool):
         raise ValueError("execute must be boolean")
-    schedule_csv, models, output = Path(schedule_csv).resolve(), Path(models).resolve(), Path(output).resolve()
+    schedule_csv, output = Path(schedule_csv).resolve(), Path(output).resolve()
+    models = Path(models).resolve() if models is not None else None
     with schedule_csv.open(newline="", encoding="utf-8-sig") as stream:
         rows = list(csv.DictReader(stream))
     identifiers = [row.get("trial_id") for row in rows]
@@ -172,44 +186,62 @@ def run_experiment(config, schedule_csv, hardware_path, models, output, execute=
     if len(selected) != 1:
         raise ValueError("Select exactly one planned trial with participant and trial ID; batches never execute automatically")
     row = selected[0]
+    if models is None and row.get("models_dir"):
+        models = _resolve(row["models_dir"], schedule_csv.parent)
+    candidate_config_sha256 = None
+    if row.get("config_file"):
+        from dasa.config import load_config
+        candidate_path = _resolve(row["config_file"], schedule_csv.parent)
+        candidate_config_sha256 = _sha(candidate_path)
+        if candidate_config_sha256 != row["config_sha256"]:
+            raise ValueError("The frozen validation configuration changed")
+        config = load_config(candidate_path)
     trial = _identifier(row["trial_id"], "trial_id")
     identifier = _identifier(row["participant_id"], "participant_id")
     if row.get("record_status", "planned") not in {"planned", "prospective"}:
         raise ValueError("Only a planned schedule row may start a new acquisition")
     condition = row["condition"]
-    if condition not in CONDITIONS or condition == "autonomous":
+    if condition not in CONDITIONS:
         raise ValueError("Unsupported participant control condition")
+    stage = row.get("stage") or "human_shared_control"
+    if condition == "autonomous" and stage != "autonomous_evaluation":
+        raise ValueError("Autonomous control is restricted to explicitly assigned physical policy evaluations")
+    if models is None and condition != "C1":
+        raise ValueError("Model-free acquisition is available only for manual demonstrations")
     delay = _finite(row["delay_seconds"], "delay_seconds")
     if _finite(row.get("command_delay_seconds") or 0, "command_delay_seconds") != 0:
         raise ValueError("The measured workstation implements zero command-channel buffering")
     intended_goal = _integer(row["intended_goal"], "intended_goal")
     seed = _integer(row["scene_seed"], "scene_seed") if row.get("scene_seed") else None
-    selected_skill = Path(skill_path).resolve() if skill_path is not None else models / "bootstrap_hsmm.npz"
-    if not selected_skill.is_file():
+    if skill_path is not None:
+        selected_skill = Path(skill_path).resolve()
+    elif row.get("policy_file") or row.get("skill_file"):
+        selected_skill = _resolve(row.get("policy_file") or row["skill_file"], schedule_csv.parent)
+    else:
+        selected_skill = models / "bootstrap_hsmm.npz" if models is not None else None
+    if selected_skill is not None and not selected_skill.is_file():
         raise ValueError("The selected skill checkpoint must be an existing file")
-    selected_skill_sha256 = _sha(selected_skill)
+    selected_skill_sha256 = _sha(selected_skill) if selected_skill is not None else None
+    if row.get("policy_sha256") and row["policy_sha256"] != selected_skill_sha256:
+        raise ValueError("The selected policy differs from the scheduled frozen checkpoint")
     hardware_source = _resolve(row["hardware_file"], schedule_csv.parent) if row.get("hardware_file") \
         else Path(hardware_path).resolve()
     hardware = copy.deepcopy(_load_hardware(hardware_source))
     scene = Scene.from_dict(hardware["scene"]).to_dict()
     if not 0 <= intended_goal < len(scene["goals"]):
         raise ValueError("intended_goal is outside the measured candidate set")
-    if row.get("scene_file"):
-        expected = _resolve(row["scene_file"], schedule_csv.parent)
-        if hardware.get("snapshot_record"):
-            if _sha(expected) != _sha(hardware["snapshot_record"]):
-                raise ValueError("Schedule scene file does not match the calibrated hardware snapshot")
-        else:
-            document = json.loads(expected.read_text(encoding="utf-8"))
-            if _scene_delta(document.get("scene", document), scene) > 1e-12:
-                raise ValueError("Schedule scene file differs from the measured hardware scene")
-    if row.get("scene_id") and row["scene_id"] != hardware.get("scene_id"):
+    if row.get("scene_file") or row.get("planned_scene_file"):
+        expected = _resolve(row.get("planned_scene_file") or row["scene_file"], schedule_csv.parent)
+        document = json.loads(expected.read_text(encoding="utf-8"))
+        if _scene_delta(document.get("scene", document), scene) > config["study"].get("hardware_scene_tolerance_m", .005):
+            raise ValueError("Measured geometry differs from the scheduled physical layout")
+    if row.get("scene_id") and hardware.get("scene_id") and row["scene_id"] != hardware["scene_id"]:
         raise ValueError("Schedule scene_id is not bound to this hardware configuration")
     timeout = _finite(row.get("timeout_seconds") or config.get("study", {}).get(
         "max_seconds", hardware["maximum_seconds"]), "timeout_seconds", positive=True)
     hardware["feedback_delay_seconds"], hardware["maximum_seconds"] = delay, timeout
     required = ["cvae.pt", "lstm.pt", "transformer.pt"]
-    if not models.is_dir() or any(not (models / name).is_file() for name in required):
+    if models is not None and (not models.is_dir() or any(not (models / name).is_file() for name in required)):
         raise ValueError("The prepared models directory requires TP-HSMM and all three network checkpoints")
     tolerance = _finite(config.get("study", {}).get("hardware_scene_tolerance_m", .005),
                         "hardware_scene_tolerance_m")
@@ -218,25 +250,34 @@ def run_experiment(config, schedule_csv, hardware_path, models, output, execute=
     if target.exists():
         raise FileExistsError("This trial/mode already has an acquisition; existing measurements are immutable")
     runtime = copy.deepcopy(config)
-    runtime["simulation"].update(feedback_delay=delay, command_delay=0., max_seconds=timeout,
+    runtime["task"].update(feedback_delay=delay, command_delay=0., max_seconds=timeout,
                                  decision_dt=hardware["loop_seconds"])
     assignment = {
         "schema_version": 1, "acquisition_id": uuid.uuid4().hex, "trial_id": trial,
         "participant_id": identifier, "condition": condition, "intended_goal": intended_goal,
         "scene_seed": seed, "scene_seed_scope": "schedule_label_not_a_source_of_measured_coordinates",
-        "scene_id": hardware.get("scene_id") or f"measured_{_json_sha(scene)[:16]}",
+        "scene_id": row.get("scene_id") or hardware.get("scene_id") or f"measured_{_json_sha(scene)[:16]}",
         "scene": scene, "scene_geometry_sha256": _json_sha(scene), "execute": execute,
-        "robot_radius_m": float(runtime["simulation"]["robot_radius"]),
+        "robot_radius_m": float(runtime["task"]["robot_radius"]),
         "feedback_delay_seconds": delay, "command_delay_seconds": 0., "timeout_seconds": timeout,
         "practice": str(row.get("practice", "false")).lower() == "true",
-        "planned_order": _integer(row["order"], "order") if row.get("order") else None,
+        "planned_order": _integer(row.get("planned_order") or row["order"], "order") if row.get("planned_order") or row.get("order") else None,
         "schedule_sha256": _sha(schedule_csv), "schedule_file": str(schedule_csv),
         "hardware_source_sha256": _sha(hardware_source), "model_source": str(models),
         "selected_skill_source": str(selected_skill), "selected_skill_sha256": selected_skill_sha256,
         "config_sha256": _json_sha(runtime), "base_config_sha256": _json_sha(config),
         "runtime_config": runtime, "software": _software(),
         "outcome_source": "independent_task_annotation_after_acquisition",
+        "stage": stage, "candidate_config_sha256": candidate_config_sha256,
+        "policy_sha256": selected_skill_sha256,
     }
+    for field in ("training_repeat", "refinement_budget", "attempt", "evaluation_index", "matched_block_index",
+                  "within_block_order", "randomization_seed"):
+        if row.get(field) is not None and row[field] != "":
+            assignment[field] = _integer(row[field], field)
+    for field in ("training_condition", "scenario", "layout_group", "candidate_id", "actor_type", "matched_block_id"):
+        if row.get(field):
+            assignment[field] = row[field]
     output.mkdir(parents=True, exist_ok=True)
     lock_path = output / ".hardware-trial.lock"
     try:
@@ -247,6 +288,7 @@ def run_experiment(config, schedule_csv, hardware_path, models, output, execute=
     common = {key: assignment[key] for key in (
         "acquisition_id", "trial_id", "participant_id", "condition", "intended_goal", "scene_seed",
         "scene_id", "scene_geometry_sha256", "execute", "selected_skill_source", "selected_skill_sha256")}
+    common.update({key: assignment[key] for key in ("stage", "layout_group", "training_repeat", "training_condition") if key in assignment})
     created = False
     try:
         with os.fdopen(lock, "w") as stream:
@@ -257,19 +299,21 @@ def run_experiment(config, schedule_csv, hardware_path, models, output, execute=
         frozen_models, inputs = target / "models", target / "inputs"
         frozen_models.mkdir()
         inputs.mkdir()
-        for source in sorted(models.iterdir()):
+        for source in sorted(models.iterdir()) if models is not None else []:
             if source.is_file() and source.suffix in {".pt", ".npz", ".json"}:
                 shutil.copyfile(source, frozen_models / source.name)
-        frozen_skill = frozen_models / ("selected_skill.npz" if skill_path is not None else "bootstrap_hsmm.npz")
-        if skill_path is not None:
+        override_skill = skill_path is not None or row.get("policy_file") or row.get("skill_file")
+        frozen_skill = frozen_models / ("selected_skill.npz" if override_skill else "bootstrap_hsmm.npz")
+        if selected_skill is not None and override_skill:
             shutil.copyfile(selected_skill, frozen_skill)
-        if _sha(frozen_skill) != selected_skill_sha256:
+        if selected_skill is not None and _sha(frozen_skill) != selected_skill_sha256:
             raise ValueError("Selected skill checkpoint changed while freezing the experiment")
         assignment["selected_skill_snapshot"] = str(frozen_skill.relative_to(target))
         assignment["model_sha256"] = {path.name: _sha(path) for path in sorted(frozen_models.iterdir())}
         shutil.copyfile(hardware_source, inputs / "hardware.source.yaml")
         shutil.copyfile(schedule_csv, inputs / "schedule.csv")
-        for key, name in (("calibration_record", "calibration.json"), ("snapshot_record", "snapshot.json")):
+        for key, name in (("calibration_record", "calibration.json"), ("snapshot_record", "snapshot.json"),
+                          ("perception_record", "perception.json"), ("tool_record", "tool.json")):
             if hardware.get(key):
                 source = _resolve(hardware[key], hardware_source.parent)
                 shutil.copyfile(source, inputs / name)
@@ -283,17 +327,15 @@ def run_experiment(config, schedule_csv, hardware_path, models, output, execute=
         common["assignment_path"] = str((target / "assignment.json").relative_to(output))
         _append(ledger, {**common, "event": "started", "timestamp_utc": datetime.now(timezone.utc).isoformat()})
         recording_path = target / "recording.json"
-        options = {"execute": execute, "condition": condition}
-        if skill_path is not None:
+        options = {"execute": execute, "condition": condition, "stage": stage}
+        if selected_skill is not None and override_skill:
             options["skill_path"] = frozen_skill
-        run_workstation(runtime, resolved, frozen_models, recording_path, **options)
+        if condition == "autonomous":
+            options["autonomous_goal"] = intended_goal
+        run_workstation(runtime, resolved, frozen_models if models is not None else None, recording_path, **options)
         recording = json.loads(recording_path.read_text(encoding="utf-8"))
         count, motion = _validate_recording(recording, assignment, execute)
-        recording["experiment_assignment"] = {
-            key: assignment[key] for key in ("trial_id", "participant_id", "intended_goal", "scene_seed",
-                                             "scene_id", "acquisition_id", "practice", "planned_order",
-                                             "timeout_seconds", "robot_radius_m")}
-        recording["experiment_assignment"]["assignment_sha256"] = common["assignment_sha256"]
+        recording["experiment_assignment"] = _recording_assignment(assignment, common)
         temporary = target / "recording.linked.tmp.json"
         write_json(temporary, recording)
         os.replace(temporary, recording_path)
@@ -308,6 +350,12 @@ def run_experiment(config, schedule_csv, hardware_path, models, output, execute=
         return result
     except BaseException as exc:
         if created:
+            saved = target / "recording.json"
+            if saved.is_file():
+                partial = json.loads(saved.read_text(encoding="utf-8"))
+                partial["experiment_assignment"] = _recording_assignment(assignment, common)
+                partial["acquisition_error"] = {"type": type(exc).__name__, "message": str(exc)}
+                write_json(saved, partial)
             failure = {**common, "event": "failed", "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                        "error_type": type(exc).__name__, "error": str(exc), "outcome": "not_inferred"}
             _append(ledger, failure)

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import hashlib
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from dasa.config import write_json
-from dasa.geometry import Scene, make_scene, waypoints
+
+from dasa.geometry import Scene
 
 
 @dataclass
@@ -55,6 +56,11 @@ class Demonstration:
             raise ValueError("Episode, operator and provenance identifiers must be nonempty strings")
         if not isinstance(self.metadata["success"], bool):
             raise ValueError("success must be a JSON boolean")
+        if self.metadata["provenance"] != "UR10_measured_teleoperation":
+            raise ValueError("Demonstrations must originate from executed, annotated hardware recordings")
+        for key in ("source_recording_sha256", "hardware_timing", "execution_contract"):
+            if key not in self.metadata:
+                raise ValueError(f"Measured demonstration is missing its acquisition link: {key}")
 
     def save(self, path: Path) -> None:
         self.validate()
@@ -80,80 +86,6 @@ class Demonstration:
                 scene=scene, goal=goal, metadata=metadata)
         result.validate()
         return result
-
-
-def synthetic_demonstration(config: dict, seed: int, operator: str, episode: str,
-                            goal: int, noise: float | None = None) -> Demonstration:
-
-    rng = np.random.default_rng(seed)
-    bootstrap = config.get("bootstrap", {})
-    noise = bootstrap.get("force_noise_std_N", 0.15) if noise is None else noise
-    scene = make_scene(config, rng)
-    points = waypoints(scene, goal, config["simulation"]["lift_height"])
-    dt = config["simulation"]["decision_dt"]
-    chunks, phases = [], []
-    for j, (start, end) in enumerate(zip(points[:-1], points[1:])):
-        speed = bootstrap.get("cruise_speed_m_s", [0.16, 0.24])
-        duration = max(bootstrap.get("segment_min_seconds", 0.45),
-                       np.linalg.norm(end - start) / rng.uniform(*speed))
-        count = max(bootstrap.get("minimum_segment_samples", 12), int(duration / dt))
-        u = np.arange(count) / count
-        smooth = 10 * u**3 - 15 * u**4 + 6 * u**5
-        path = start + smooth[:, None] * (end - start)
-
-        side = rng.normal(0, bootstrap.get("lateral_std_m", 0.008), 3)
-        path += np.sin(np.pi * u)[:, None] ** 2 * side
-        chunks.append(path)
-        phases.extend([0 if j <= 2 else (1 if j == 3 else 2)] * count)
-    position = np.vstack([*chunks, points[-1][None]])
-    phase = np.r_[phases, 3]
-    time = np.arange(len(position)) * dt
-    velocity = np.gradient(position, dt, axis=0)
-    acceleration = np.gradient(velocity, dt, axis=0)
-    force = config["simulation"]["mass"] * acceleration + config["simulation"]["damping"] * velocity
-    force += rng.normal(0, noise, force.shape)
-    metadata = {"episode_id": episode, "operator_id": operator,
-                "provenance": "synthetic_quintic_demonstration", "seed": seed,
-                "success": True, "collision": False, "bounds_violation": False,
-                "grasped_goal": goal, "placed": True, "delay_seconds": 0.0,
-                "source_condition": "bootstrap", "noise_std_newton": noise}
-    result = Demonstration(time, position, velocity, force,
-                           np.c_[position, velocity], phase, scene, goal, metadata)
-    result.validate()
-    return result
-
-
-def generate_dataset(config: dict, root: Path) -> dict:
-    splits = {}
-    inventory = []
-    e = config["experiments"]
-    count_fields = [("train", "bootstrap_demonstrations"),
-                    ("validation", "validation_demonstrations"), ("test", "test_demonstrations")]
-    for split_index, (split, field) in enumerate(count_fields):
-        paths = []
-        for j in range(e[field]):
-            seed = config["seed"] + 10000 * split_index + j
-            operator = f"synthetic_{split}_{j % 5:02d}"
-            episode = f"{split}_{j:04d}"
-            path = root / split / f"{episode}.npz"
-            demo = synthetic_demonstration(config, seed, operator, episode, j % 3)
-            demo.save(path)
-            paths.append(str(path.relative_to(root)))
-            inventory.append({"path": str(path.relative_to(root)), "split": split,
-                              "generation_order": len(inventory), "episode_id": episode,
-                              "operator_id": operator, "seed": seed, "goal": j % 3,
-                              "samples": len(demo.time), "duration_seconds": float(demo.time[-1]),
-                              "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                              "provenance": demo.metadata["provenance"], "scene": demo.scene.to_dict()})
-        splits[split] = paths
-    validate_partitions(root, splits)
-    write_json(root / "splits.json", splits)
-    write_json(root / "inventory.json", {"schema_version": 1,
-        "generator": "quintic_bootstrap_v1", "generation_order": "train, validation, test; index ascending",
-        "split_seed_rule": "seed + 10000*split_index + episode_index",
-        "counts": {s: len(p) for s, p in splits.items()},
-        "fractions": {s: len(p) / len(inventory) for s, p in splits.items()}, "records": inventory})
-    return splits
 
 
 def validate_partitions(root: Path, splits: dict) -> None:
@@ -184,15 +116,53 @@ def validate_partitions(root: Path, splits: dict) -> None:
         seen_signals |= signals
 
 
+def assemble_dataset(config: dict, training: Path, validation: Path, test: Path, output: Path):
+    from dasa.config import write_json
+
+    sources = {"train": Path(training), "validation": Path(validation), "test": Path(test)}
+    output = Path(output)
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError("Use an empty destination to preserve prior datasets")
+    splits, inventory = {}, []
+    for name, source in sources.items():
+        paths = sorted(source.glob("*.npz"))
+        if not paths or (name == "train" and len(paths) != config["experiments"]["bootstrap_demonstrations"]):
+            raise ValueError("Supply 50 training recordings and nonempty independent validation/test sets")
+        splits[name] = []
+        for path in paths:
+            demo = Demonstration.load(path)
+            if name == "train" and float(demo.metadata["delay_seconds"]) != 0:
+                raise ValueError("Initial training demonstrations must have zero configured feedback delay")
+            if name == "train":
+                accepted, reasons = successful(demo, config)
+                if not accepted:
+                    raise ValueError(f"Rejected initial demonstration {path.name}: {reasons}")
+            relative = Path(name) / path.name
+            target = output / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, target)
+            splits[name].append(relative.as_posix())
+            inventory.append({"file": relative.as_posix(), "split": name,
+                              "episode_id": demo.metadata["episode_id"],
+                              "operator_id": demo.metadata["operator_id"],
+                              "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                              "source_recording_sha256": demo.metadata["source_recording_sha256"]})
+    validate_partitions(output, splits)
+    write_json(output / "splits.json", splits)
+    write_json(output / "inventory.json", {"provenance": "UR10_measured_teleoperation",
+                                           "partition_unit": "operator", "records": inventory})
+    return splits
+
+
 def successful(demo: Demonstration, config: dict) -> tuple[bool, list[str]]:
     demo.validate()
     reasons = []
     m = demo.metadata
-    limits = {"maximum_seconds": config["simulation"]["max_seconds"],
-              "robot_radius_m": config["simulation"]["robot_radius"],
-              "place_tolerance_m": config["simulation"]["place_tolerance"],
-              "workspace_min_m": config["simulation"]["workspace_min"],
-              "workspace_max_m": config["simulation"]["workspace_max"]}
+    limits = {"maximum_seconds": config["task"]["max_seconds"],
+              "robot_radius_m": config["task"]["robot_radius"],
+              "place_tolerance_m": config["task"]["place_tolerance"],
+              "workspace_min_m": config["task"]["workspace_min"],
+              "workspace_max_m": config["task"]["workspace_max"]}
     if m["provenance"] == "UR10_measured_teleoperation" and "execution_contract" in m:
         recorded = m["execution_contract"]
         if not isinstance(recorded, dict) or any(key not in recorded for key in limits):
@@ -230,8 +200,14 @@ def successful(demo: Demonstration, config: dict) -> tuple[bool, list[str]]:
             demo.position > np.asarray(limits["workspace_max_m"])):
         reasons.append("recorded_position_outside_workspace")
     radii = limits["robot_radius_m"]
-    if any(demo.scene.swept_clearance(a, b, radii) <= 0
-           for a, b in zip(demo.position[:-1], demo.position[1:])):
+    if m.get("hardware_timing", {}).get("scene_mode") == "online":
+        minimum = m.get("observed_minimum_surface_clearance_m")
+        if minimum is None or not np.isfinite(minimum):
+            reasons.append("missing_online_geometry_measurements")
+        elif minimum <= 0:
+            reasons.append("observed_online_clearance_violation")
+    elif any(demo.scene.swept_clearance(a, b, radii) <= 0
+             for a, b in zip(demo.position[:-1], demo.position[1:])):
         reasons.append("swept_collision")
     if np.linalg.norm(demo.position[-1] - demo.scene.place) > limits["place_tolerance_m"]:
         reasons.append("placement_error")

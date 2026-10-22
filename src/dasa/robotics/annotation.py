@@ -38,6 +38,11 @@ def write_annotation(recording: Path, output: Path, episode: str, operator: str,
         raise ValueError("Recording condition and feedback delay are required")
     if not np.isfinite(delay) or delay < 0:
         raise ValueError("Recorded delay must be finite and nonnegative")
+    if outcome == "success":
+        events = {event.get("event") for event in data.get("task_events", [])}
+        required = {"grasp_contact_detected", "lift_height_reached", "gripper_open_measured"}
+        if not required.issubset(events) or data.get("stop_reason") != "release_completed_requires_independent_annotation":
+            raise ValueError("A successful annotation requires measured grasp, lift and release completion")
     result = {"episode_id": episode, "operator_id": operator, "intended_goal": intended_goal,
               "grasped_goal": grasped_goal, "success": outcome == "success",
               "placed": outcome == "success", "collision": outcome == "collision",
@@ -45,5 +50,6 @@ def write_annotation(recording: Path, output: Path, episode: str, operator: str,
               "source_condition": condition, "delay_seconds": float(delay),
               "annotation_source": "operator_entered_outcome",
               "source_recording_sha256": hashlib.sha256(recording.read_bytes()).hexdigest()}
+    result["stage"] = data["stage"]
     write_json(output, result)
     return result

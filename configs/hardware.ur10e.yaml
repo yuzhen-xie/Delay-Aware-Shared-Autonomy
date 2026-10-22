@@ -1,0 +1,4 @@
+robot:
+  model: UR10e
+  mode: force
+loop_seconds: 0.002

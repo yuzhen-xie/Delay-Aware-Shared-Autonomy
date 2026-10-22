@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import socket
 import sys
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -13,275 +14,336 @@ import numpy as np
 from dasa.config import write_json
 from dasa.control.hierarchy import HierarchicalController
 from dasa.control.motion import ForceKalman
+from dasa.control.physical_passivity import PhysicalPassivity
 from dasa.data import Demonstration
 from dasa.delay import DelayBuffer
 from dasa.geometry import Scene, clamp_norm
 from dasa.models.hsmm import TPHSMM
 from dasa.models.intent import load_models
-from dasa.robotics.interfaces import FeedbackLedger, MasterUDP, RobotiqSocket, URRTDE
+from dasa.robotics.camera import CameraUnavailable, RGBDStream, RealSenseCamera, VideoServer
 from dasa.robotics.configuration import load_hardware
+from dasa.robotics.interfaces import FeedbackLedger, MasterUDP, RobotiqSocket, URRTDE
 from dasa.robotics.kinematics import jacobian
-from dasa.simulation import Trial
+from dasa.robotics.task import GraspPlaceTask, GripperWorker
+from dasa.robotics.master import MasterRecorder
 
 
 class ManualController:
-    def __init__(self, config: dict):
-        self.maximum_force = config["simulation"]["force_limit"]
+    def __init__(self, config):
+        self.config = config
+        self.maximum_force = config["task"]["force_limit"]
         self.kalman = ForceKalman(config["motion"]["kalman_process"],
                                   config["motion"]["kalman_measurement"],
-                                  config["motion"].get("kalman_initial_variance", 1.0))
+                                  config["motion"].get("kalman_initial_variance", 1.),
+                                  config["task"]["decision_dt"])
 
     def decide(self, raw, observed, current, age, phase, grasped_goal, rho):
-        human = self.kalman.step(np.asarray(raw, float))
-        return {"human_force": human,
-                "nominal_force": clamp_norm(human, self.maximum_force),
-                "alpha": 0.0, "lambda": 0.0}
+        human = clamp_norm(self.kalman.step(np.asarray(raw, float), self.config["task"]["decision_dt"]), self.maximum_force)
+        return {"human_force": human, "motion_force": human, "nominal_force": human,
+                "autonomous_force": np.zeros(3), "autonomous_damping_gain": 0.,
+                "alpha": 0., "lambda": 0., "authority_scale": 1.,
+                "autonomy_confidence": 0., "human_confidence": 1. - rho}
 
 
-def admittance_velocity(force, velocity, config: dict, dt: float, maximum_speed=.08):
-    force, velocity = np.asarray(force, float), np.asarray(velocity, float)
-    mass, damping = config["simulation"]["mass"], config["simulation"]["damping"]
-    if (force.shape != (3,) or velocity.shape != (3,)
-            or not np.isfinite(np.r_[force, velocity, mass, damping, dt, maximum_speed]).all()
-            or mass <= 0 or damping < 0 or dt <= 0 or maximum_speed <= 0):
-        raise ValueError("Admittance needs finite 3D signals and positive mass, step and speed limit")
-    desired = ((2 * mass - dt * damping) * velocity + 2 * dt * force) / (2 * mass + dt * damping)
-    return clamp_norm(desired, maximum_speed)
+def _scene_difference(a, b):
+    if a.frame != b.frame or a.obstacle_ids != b.obstacle_ids:
+        return float("inf")
+    errors = []
+    for name in ("goals", "start", "place", "centers", "radii"):
+        x, y = getattr(a, name), getattr(b, name)
+        if x.shape != y.shape:
+            return float("inf")
+        errors.append(float(np.max(np.abs(x - y), initial=0.)))
+    return max(errors)
 
 
-def replay(config: dict, models: Path, trial_path: Path, output: Path, condition="C3",
-           skill_path: Path | None = None):
-    trial = Trial.load(trial_path)
-    scene = Scene.from_dict(trial.metadata["scene"])
-    skill_file = Path(skill_path) if skill_path is not None else models / "bootstrap_hsmm.npz"
-    skill = TPHSMM.load(config, skill_file)
-    cvae, _ = load_models(config, models)
-    controller = HierarchicalController(config, scene, skill, cvae, condition)
-    records, grasped = [], None
-    for k in range(len(trial.arrays["time"])):
-        a = trial.arrays
-        phase = int(a["phase"][k])
-        if phase > 0:
-            grasped = trial.metadata["grasped_goal"]
-        current = a["current_state"][k] if "current_state" in a else np.r_[a["position"][k], a["velocity"][k]]
-        decision = controller.decide(a["raw_force"][k], a["observed_state"][k], current,
-                                     a["feedback_age"][k], phase, grasped, a["rho"][k],
-                                     bool(a["corrective"][k]))
-        velocity = admittance_velocity(decision["nominal_force"], a["velocity"][k], config,
-                                        config["simulation"]["decision_dt"])
-        records.append({"time": a["time"][k], "nominal_force": decision["nominal_force"],
-                        "bounded_velocity": velocity, "motion_sent": False})
-    write_json(output, {"mode": "offline_replay", "condition": condition, "records": records,
-                        "skill_file": skill_file.name,
-                        "skill_sha256": hashlib.sha256(skill_file.read_bytes()).hexdigest()})
-
-
-def run_workstation(config: dict, hardware_file: Path, models: Path | None, output: Path,
-                    execute=False, condition="C3", skill_path: Path | None = None):
+def run_workstation(config, hardware_file, models, output, execute=False, condition="C3",
+                    skill_path=None, autonomous_goal=None, stage=None):
+    output = Path(output)
+    if output.exists():
+        raise FileExistsError("Measured recordings are immutable; select a new output file")
+    if condition == "autonomous" and autonomous_goal is None:
+        raise ValueError("A physical autonomous evaluation requires an assigned goal")
     if models is None and (condition != "C1" or skill_path is not None):
-        raise ValueError("Model-free acquisition supports manual C1 without a learned skill")
+        raise ValueError("Model-free acquisition is available only for initial C1 demonstrations")
     hardware = load_hardware(hardware_file)
     scene = Scene.from_dict(hardware["scene"])
-    acknowledgement_deadline = hardware["limits"].get(
-        "feedback_acknowledgement_seconds", hardware["limits"]["watchdog_seconds"])
     c = copy.deepcopy(config)
-    c["simulation"]["decision_dt"] = hardware["loop_seconds"]
-    model_hashes = {}
-    skill_file, skill_digest = None, None
-    if models is None:
-        controller = ManualController(c)
-        controller_mode = "manual_bootstrap"
-    else:
+    c["task"].update(decision_dt=hardware["loop_seconds"], max_seconds=hardware["maximum_seconds"])
+    limits, period = hardware["limits"], hardware["loop_seconds"]
+    session_id = uuid.uuid4().hex
+    acquisition_started_utc = datetime.now(timezone.utc).isoformat()
+    stage = stage or ("human_bootstrap" if models is None else
+                      "autonomous_evaluation" if condition == "autonomous" else "human_shared_control")
+    controller, hashes = ManualController(c), {}
+    if models is not None:
         models = Path(models)
         skill_file = Path(skill_path) if skill_path is not None else models / "bootstrap_hsmm.npz"
-        skill_digest = hashlib.sha256(skill_file.read_bytes()).hexdigest()
-        skill = TPHSMM.load(config, skill_file)
-        cvae, _ = load_models(config, models)
-        controller = HierarchicalController(c, scene, skill, cvae, condition)
-        controller_mode = "trained_shared_control"
-        model_hashes = {"skill": skill_digest, **{
-            name: hashlib.sha256((models / name).read_bytes()).hexdigest()
-            for name in ("cvae.pt", "lstm.pt", "transformer.pt") if (models / name).is_file()}}
-    robot, master, gripper = None, None, None
+        cvae, _ = load_models(c, models)
+        controller = HierarchicalController(c, scene, TPHSMM.load(c, skill_file), cvae, condition)
+        hashes = {"skill": hashlib.sha256(skill_file.read_bytes()).hexdigest(),
+                  **{p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in models.glob("*.pt")}}
+    engine = PhysicalPassivity(c, session_id)
+    task = GraspPlaceTask(c, scene, autonomous_goal if condition == "autonomous" else None)
+    robot = master = grip = stream = video = None
     address = None
-    samples, commands, gripper_commands = [], [], []
-    reflection_work, stop_reason = 0.0, "initialization"
+    samples, decisions, startup, video_pairs = [], [], [], {}
+    last_force, stop_reason, error_record = np.zeros(3), "initialization", None
+    started = trial_start = None
+    deadman_released = False
     cleanup_errors = []
+    recorder = MasterRecorder(output.with_suffix(".samples"))
     try:
-        robot = URRTDE(hardware["robot"]["host"], execute, hardware["limits"]["maximum_speed_m_s"])
-        master = MasterUDP(hardware["master"]["udp_port"], hardware["limits"]["watchdog_seconds"])
-        if hardware["gripper"]["type"] == "robotiq_socket":
-            gc = hardware["gripper"]
-            gripper = RobotiqSocket(hardware["robot"]["host"], gc["port"], execute,
-                                     gc.get("speed", 64), gc.get("force", 64),
-                                     gc.get("timeout_seconds", 1.0))
-            if execute:
-                status = gripper.status()
-                if not status["active"] or status["activation_status"] != 3 or status["fault"]:
-                    raise RuntimeError("Activate the Robotiq gripper before starting a measured trial")
-        initial = robot.state()
-        if np.linalg.norm(initial.position - scene.start) > hardware["limits"].get("start_tolerance_m", .05):
-            raise ValueError("Measured TCP position exceeds the declared initial-pose tolerance")
-        observations = DelayBuffer(np.r_[initial.position, initial.velocity, initial.wrench],
-                                   hardware["feedback_delay_seconds"] + 1)
-        feedback_frames = FeedbackLedger()
-        started, phase, grasped, grip_previous = time.monotonic(), 0, None, False
-        previous_receive_time, previous_reflected = started, np.zeros(3)
-        stop_reason = "duration"
-        while time.monotonic() - started < hardware["maximum_seconds"]:
-            tick = time.monotonic()
-            state = robot.state()
-            elapsed = tick - started
-            observations.push(elapsed, np.r_[state.position, state.velocity, state.wrench])
-            delayed = observations.observe(elapsed, hardware["feedback_delay_seconds"])
+        robot = URRTDE(hardware["robot"]["host"], execute, limits["maximum_speed_m_s"],
+                       hardware["robot"]["model"], c["task"]["force_limit"])
+        tool, mode = hardware["tool"], hardware["force_mode"]
+        robot.configure_tool(tool["tcp_pose"], tool["payload_mass_kg"], tool["payload_cog_m"],
+                             mode["damping"], mode["gain"])
+        if hardware["gripper"]["type"] != "robotiq_socket":
+            raise ValueError("This task executor requires measured Robotiq object-contact feedback")
+        gc = hardware["gripper"]
+        device = RobotiqSocket(hardware["robot"]["host"], gc["port"], execute,
+                                gc["speed"], gc["force"], gc["timeout_seconds"])
+        status = device.status()
+        if not status["active"] or status["activation_status"] != 3 or status["fault"]:
+            raise RuntimeError("The physical gripper must be activated and fault-free before acquisition")
+        if status["position"] > 10 or status["object_status"] != 3:
+            raise RuntimeError("Open the physical gripper and remove retained objects before starting the trial")
+        grip = GripperWorker(device).start()
+        cc = hardware["camera"]
+        stream = RGBDStream(RealSenseCamera(hardware["calibration_record"],
+                              output.with_suffix(".rgbd"), cc["width"], cc["height"], cc["fps"],
+                              cc.get("serial")), hardware["perception_record"], cc["scene_mode"],
+                              max(cc["history_seconds"], hardware["feedback_delay_seconds"] + 2.)).start()
+        deadline = time.monotonic() + 5.
+        while True:
             try:
-                packet, address = master.read()
-            except socket.timeout:
-                robot.stop()
-                stop_reason = "master_watchdog"
+                measured_scene = Scene.from_dict(stream.snapshot()["scene"])
                 break
-            except (ValueError, KeyError, TypeError):
-                robot.stop()
-                stop_reason = "invalid_master_packet"
+            except CameraUnavailable:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.01)
+        if _scene_difference(scene, measured_scene) > c.get("study", {}).get("hardware_scene_tolerance_m", .005):
+            raise ValueError("Live calibrated geometry differs from the assigned measured layout")
+        video = VideoServer(hardware["video"]["host"], hardware["video"]["port"],
+                             cc["maximum_pairing_skew_seconds"]).start()
+        master = MasterUDP(hardware["master"]["udp_port"], min(period, limits["watchdog_seconds"]))
+        initial = robot.state()
+        if np.linalg.norm(initial.position - scene.start) > limits["start_tolerance_m"]:
+            raise ValueError("Actual TCP position is outside the assigned start tolerance")
+        observations = DelayBuffer(np.r_[initial.position, initial.velocity, initial.wrench],
+                                   hardware["feedback_delay_seconds"] + 2.)
+        ledger = FeedbackLedger()
+        started, last_robot_stamp = time.monotonic(), None
+        robot.configure_watchdog(c["passivity"]["physical"]["robot_maximum_hold_seconds"])
+        next_tick, stop_reason = started, "arming_timeout"
+        previous_frame_sequence = -1
+        while True:
+            tick = time.monotonic()
+            if trial_start is None and tick - started > hardware.get("arming_timeout_seconds", 30.):
                 break
-            received_time = packet["host_receive_monotonic"]
-            reflection_work += (received_time - previous_receive_time) * float(
-                previous_reflected @ np.asarray(packet["velocity_m_s"]))
-            previous_receive_time = received_time
-            acknowledged = feedback_frames.acknowledge(
-                packet.get("observation_sequence"), received_time, acknowledgement_deadline)
-            if np.any(state.position < hardware["limits"]["workspace_min_m"]) or np.any(
-                    state.position > hardware["limits"]["workspace_max_m"]):
-                robot.stop()
-                stop_reason = "workspace_boundary"
+            if trial_start is not None and tick - trial_start >= hardware["maximum_seconds"]:
+                stop_reason = "timeout"
                 break
-            if np.linalg.svd(jacobian(state.joints, hardware["robot"]["model"]), compute_uv=False)[-1] < hardware["limits"]["minimum_jacobian_singular_value"]:
-                robot.stop()
-                stop_reason = "kinematic_singularity"
-                break
-            raw = clamp_norm(packet["force_N"], hardware["limits"]["maximum_master_force_N"])
-            if phase == 1 and state.position[2] >= c["simulation"]["lift_height"] - .05:
-                phase = 2
-            phase_at_decision = phase
-            decision, desired, observed, source_time, feedback_age = None, np.zeros(3), None, None, None
-            if acknowledged is not None:
-                observed = acknowledged.state
-                source_time = acknowledged.source_time
-                feedback_age = received_time - acknowledged.host_source_time
-                decision = controller.decide(raw, observed, np.r_[state.position, state.velocity],
-                                             feedback_age, phase, grasped, 0.0)
-                desired = admittance_velocity(decision["nominal_force"], state.velocity, c,
-                                                hardware["loop_seconds"],
-                                                hardware["limits"]["maximum_speed_m_s"])
-
-            next_position = state.position + desired * hardware["limits"]["watchdog_seconds"]
-            clearance = scene.swept_clearance(state.position, next_position,
-                                              c["simulation"]["robot_radius"] + hardware["limits"]["obstacle_margin_m"])
-            enabled = bool(packet["enable"] and acknowledged is not None and clearance > 0
-                           and state.safety_mode in {1, 2})
-            executed = robot.speed(desired, hardware["loop_seconds"], enabled)
-            if enabled and (executed or not execute) and packet["grip"] != grip_previous:
-                if gripper:
-                    gripper_commands.append({"time": elapsed, **gripper.command(packet["grip"])})
-                grip_previous = packet["grip"]
-                if grip_previous:
-                    grasped = int(np.argmin(np.linalg.norm(scene.goals - state.position, axis=1)))
-                    phase = 1
-                elif phase >= 1:
-                    phase = 3
-
-            feedback_ready = elapsed - delayed.source_time >= hardware["feedback_delay_seconds"] - 1e-9
+            state = robot.state()
+            fresh_deadline = tick + min(period, .01)
+            while last_robot_stamp is not None and state.timestamp <= last_robot_stamp:
+                if time.monotonic() >= fresh_deadline:
+                    raise RuntimeError("RTDE state did not advance within its sampling deadline")
+                time.sleep(.0002)
+                state = robot.state()
+            sample_time = time.monotonic()
+            last_robot_stamp = state.timestamp
+            elapsed = sample_time - started
+            observations.push(elapsed, np.r_[state.position, state.velocity, state.wrench])
+            packet, address = master.read()
+            received = packet["host_receive_monotonic"]
+            if "energy_packet" not in packet:
+                raise ValueError("A physical master command requires its PC1 energy ledger")
+            epoch_ready = packet.get("robot_session_ack") == session_id
+            engine.begin_sample(sample_time, state.wrench[:3], state.position, state.velocity,
+                                packet["energy_packet"] if epoch_ready else None,
+                                executed_command_force_N=last_force)
+            delayed = observations.observe(elapsed, hardware["feedback_delay_seconds"])
             feedback = None
-            if feedback_ready:
-                feedback = feedback_frames.issue(delayed.state[:6], delayed.state[6:],
-                                                  delayed.source_time,
-                                                  started + delayed.source_time, time.monotonic())
-            reflected = clamp_norm(-delayed.state[6:9], hardware["limits"]["maximum_reflection_force_N"])
-            if not enabled or not executed or feedback is None or phase == 3:
-                reflected = np.zeros(3)
-            master.reflect_force(reflected, address, feedback.payload() if feedback else None)
-            previous_reflected = reflected.copy()
-            samples.append({"time": elapsed, "robot_timestamp": state.timestamp,
-                            "position": state.position, "velocity": state.velocity,
-                            "raw_force": raw, "observed_state": observed,
-                            "source_time": source_time, "feedback_age": feedback_age,
-                            "feedback_acknowledged": acknowledged is not None,
-                            "acknowledged_observation_sequence": (
-                                acknowledged.observation_sequence if acknowledged else None),
-                            "sent_observation_sequence": feedback.observation_sequence if feedback else None,
-                            "sent_feedback_source_time": feedback.source_time if feedback else None,
-                            "master_sequence": packet["sequence"],
-                            "master_skipped_packets": packet.get("skipped_packets", 0),
-                            "master_invalid_packets": packet.get("invalid_packets", 0),
-                            "host_receive_time": received_time - started, "phase": phase_at_decision,
-                            "phase_after_action": phase,
-                            "measured_wrench": state.wrench,
-                            "delayed_feedback_wrench": delayed.state[6:],
-                            "reflected_force": reflected,
-                            "master_velocity": packet["velocity_m_s"],
-                            "cumulative_reflection_work_J": reflection_work,
-                            "actual_cadence_seconds": time.monotonic() - tick,
-                            "enabled": enabled, "executed": bool(executed)})
-            commands.append(decision)
-            if phase == 3:
-                robot.stop()
-                stop_reason = "gripper_release"
+            if elapsed - delayed.source_time >= hardware["feedback_delay_seconds"] - 1e-9:
+                image = stream.at(started + delayed.source_time, cc["maximum_pairing_skew_seconds"],
+                                  cc["maximum_age_seconds"])
+                if image.sequence != previous_frame_sequence:
+                    frame = ledger.issue(delayed.state[:6], delayed.state[6:], delayed.source_time,
+                                           started + delayed.source_time, time.monotonic())
+                    reflection = clamp_norm(-delayed.state[6:9], limits["maximum_reflection_force_N"])
+                    pairing = video.publish(image, frame.observation_sequence, frame.source_time,
+                                              frame.host_source_time, frame.state, frame.wrench[:3], reflection)
+                    feedback = {**frame.payload(), **pairing}
+                    video_pairs[frame.observation_sequence] = pairing
+                    previous_frame_sequence = image.sequence
+            acknowledged = ledger.acknowledge(packet.get("observation_sequence"), received,
+                                                limits["feedback_acknowledgement_seconds"])
+            if acknowledged is not None:
+                pairing = video_pairs.get(acknowledged.observation_sequence)
+                if (pairing is None or packet.get("video_sequence") != pairing["video_sequence"]
+                        or packet.get("video_session_id") != pairing["video_session_id"]):
+                    acknowledged = None
+            if not packet["enable"]:
+                deadman_released = True
+            if np.any(state.position < limits["workspace_min_m"]) or np.any(state.position > limits["workspace_max_m"]):
+                raise RuntimeError("Actual TCP crossed its commissioned workspace boundary")
+            if state.safety_mode != 1:
+                raise RuntimeError("The UR controller is not in normal safety mode")
+            if np.linalg.norm(state.velocity) > limits["maximum_speed_m_s"] + .002:
+                raise RuntimeError("Measured TCP speed exceeded the commissioned bound")
+            if np.linalg.svd(jacobian(state.joints, hardware["robot"]["model"]), compute_uv=False)[-1] < limits["minimum_jacobian_singular_value"]:
+                raise RuntimeError("Measured joints approached the declared singularity limit")
+            stream.latest(cc["maximum_age_seconds"])
+            if cc["scene_mode"] == "online":
+                current_scene = Scene.from_dict(stream.snapshot()["scene"])
+                if isinstance(controller, HierarchicalController):
+                    controller.update_scene(current_scene, freeze_task_frames=task.phase > 0)
+                    scene = controller.scene
+                    task.scene = scene
+            clearance = float(scene.clearance(state.position, c["task"]["robot_radius"]).min())
+            safety_distance = limits["maximum_speed_m_s"] * c["passivity"]["physical"]["robot_maximum_hold_seconds"]
+            enabled = bool(packet["enable"] and deadman_released and epoch_ready and acknowledged is not None
+                           and video.connected and clearance > limits["obstacle_margin_m"] + safety_distance)
+            if trial_start is not None and not enabled:
+                raise RuntimeError("An active trial lost deadman, displayed feedback or geometric clearance")
+            observed = acknowledged.state if acknowledged else None
+            source_time = acknowledged.source_time if acknowledged else None
+            age = received - acknowledged.host_source_time if acknowledged else None
+            raw = clamp_norm(packet["force_N"], limits["maximum_master_force_N"])
+            decision, corrected, phase_at_decision = None, np.zeros(3), task.phase
+            if enabled:
+                if trial_start is None:
+                    trial_start = sample_time
+                    stop_reason = "active"
+                actual_dt = engine.port.last_dt or period
+                c["task"]["decision_dt"] = actual_dt
+                port_audit = engine.diagnostics()
+                removed_j = port_audit["rho_window_removed_work_j"] + float(packet.get("rho_window_removed_work_j", 0.))
+                nominal_j = port_audit["rho_window_nominal_positive_work_j"] + float(packet.get("rho_window_nominal_positive_work_j", 0.))
+                rho = float(np.clip(removed_j / max(nominal_j, 1e-12), 0., 1.))
+                engine.set_transparency_ratio(rho)
+                if isinstance(controller, HierarchicalController):
+                    decision = controller.decide(raw, observed, np.r_[state.position, state.velocity],
+                        age, task.phase, task.grasped_goal, rho,
+                        autonomous_goal=autonomous_goal if condition == "autonomous" else None)
+                else:
+                    decision = controller.decide(raw, observed, np.r_[state.position, state.velocity],
+                                                 age, task.phase, task.grasped_goal, rho)
+                alpha, blend = decision["alpha"], decision["lambda"]
+                original = decision["autonomous_force"]
+                corrected_velocity = engine.limit_autonomy_velocity(original, state.velocity, alpha,
+                                    blend, actual_dt, three_port=condition != "C1")
+                autonomy = original + decision["autonomous_damping_gain"] * (state.velocity - corrected_velocity)
+                nominal = decision["authority_scale"] * ((1 - alpha) * decision["motion_force"] + alpha * autonomy)
+                nominal = clamp_norm(nominal, c["task"]["force_limit"])
+                corrected = engine.limit_robot_force(nominal, state.velocity, alpha, blend, period,
+                                                       three_port=condition != "C1")
+                decision.update(autonomous_force_after_PC3=autonomy, nominal_force=nominal,
+                                 executed_force=corrected, PC3_velocity=corrected_velocity, rho=rho)
+            else:
+                engine.limit_autonomy_velocity(np.zeros(3), state.velocity, 0., 0., period,
+                                               three_port=condition != "C1")
+                corrected = engine.limit_robot_force(np.zeros(3), state.velocity, 0., 0., period,
+                                                       three_port=condition != "C1")
+            executed = robot.force(corrected, period, bool(enabled and execute))
+            last_force = corrected.copy() if executed else np.zeros(3)
+            status = grip.status()
+            request = task.update(elapsed, state.position, state.velocity, packet["grip"], status, enabled and execute)
+            if execute and enabled:
+                grip.request(request)
+            reflected = clamp_norm(-delayed.state[6:9], limits["maximum_reflection_force_N"]) if enabled else np.zeros(3)
+            master.reflect_force(reflected, address, feedback, engine.packet())
+            record = {"time": elapsed, "robot_timestamp": state.timestamp, "position": state.position,
+                "rotation_vector": state.rotation_vector, "velocity": state.velocity, "joints": state.joints,
+                "raw_force": raw, "observed_state": observed, "source_time": source_time,
+                "feedback_age": age, "feedback_acknowledged": acknowledged is not None,
+                "acknowledged_observation_sequence": acknowledged.observation_sequence if acknowledged else None,
+                "acknowledged_video_sequence": packet.get("video_sequence"),
+                "acknowledged_video_session_id": packet.get("video_session_id"),
+                "sent_observation_sequence": feedback["observation_sequence"] if feedback else None,
+                "master_sequence": packet["sequence"], "master_skipped_packets": packet.get("skipped_packets", 0),
+                "host_receive_time": received - started, "phase": phase_at_decision,
+                "phase_after_action": task.phase, "measured_wrench": state.wrench,
+                "reflected_force": reflected, "executed_force": last_force,
+                "master_velocity": packet["velocity_m_s"], "master_energy": packet["energy_packet"],
+                "robot_session_ack": packet.get("robot_session_ack"),
+                "passivity": engine.diagnostics(), "decision": decision, "gripper_status": status,
+                "minimum_clearance_m": clearance, "enabled": enabled, "executed": bool(executed),
+                "scene": scene.to_dict() if cc["scene_mode"] == "online" else None,
+                "actual_cadence_seconds": engine.port.last_dt}
+            recorder.append(record)
+            if trial_start is None:
+                startup.append(record)
+            else:
+                samples.append(record)
+                decisions.append(decision)
+            if task.stop_reason:
+                stop_reason = task.stop_reason
                 break
-            remaining = hardware["loop_seconds"] - (time.monotonic() - tick)
+            next_tick += period
+            remaining = next_tick - time.monotonic()
             if remaining > 0:
                 time.sleep(remaining)
-            elif -remaining > hardware["limits"]["watchdog_seconds"]:
-                robot.stop()
-                stop_reason = "host_cadence_watchdog"
-                break
+            elif -remaining > c["passivity"]["physical"]["robot_maximum_hold_seconds"]:
+                raise RuntimeError("Robot command scheduling exceeded the reserved hold interval")
     except BaseException as exc:
-        stop_reason = f"exception_{type(exc).__name__}"
+        stop_reason = f"fault_{type(exc).__name__}"
+        error_record = {"type": type(exc).__name__, "message": str(exc)}
         raise
     finally:
         unwinding = sys.exc_info()[0] is not None
+        if robot is not None:
+            try:
+                robot.stop()
+            except Exception as exc:
+                cleanup_errors.append(str(exc))
         if master is not None and address is not None:
             try:
-                master.reflect_force(np.zeros(3), address, feedback=None)
+                master.reflect_force(np.zeros(3), address, None, engine.packet())
             except Exception as exc:
-                cleanup_errors.append({"device": "master_zero_force", "error_type": type(exc).__name__})
-        for name, device in (("robot", robot), ("master", master)):
+                cleanup_errors.append(str(exc))
+        for device in (grip, video, stream, master, robot, recorder):
             if device is not None:
                 try:
                     device.close()
                 except Exception as exc:
-                    cleanup_errors.append({"device": name, "error_type": type(exc).__name__})
-        write_json(output, {"schema_version": 2, "provenance": "UR10_workstation_measurement",
-                            "execute": execute, "condition": condition, "stop_reason": stop_reason,
-                            "scene": scene.to_dict(), "samples": samples, "decisions": commands,
-                            "controller_mode": controller_mode, "model_hashes": model_hashes,
-                            **({"skill_file": skill_file.name, "skill_sha256": skill_digest}
-                               if skill_file is not None else {}),
-                            "calibration_sha256": hardware["calibration_sha256"],
-                            "snapshot_sha256": hardware.get("snapshot_sha256"),
-                            "gripper_commands": gripper_commands, "cleanup_errors": cleanup_errors,
-                            "execution_contract": {
-                                "maximum_seconds": hardware["maximum_seconds"],
-                                "robot_radius_m": c["simulation"]["robot_radius"],
-                                "place_tolerance_m": c["simulation"]["place_tolerance"],
-                                "workspace_min_m": hardware["limits"]["workspace_min_m"],
-                                "workspace_max_m": hardware["limits"]["workspace_max_m"]},
-                            "timing": {"feedback_delay_seconds": hardware["feedback_delay_seconds"],
-                                       "feedback_channels": ["cartesian_state", "measured_wrench"],
-                                       "feedback_definition": "one_way_host_buffer_then_bridge_acknowledgement",
-                                       "acknowledgement_deadline_seconds": acknowledgement_deadline,
-                                       "nominal_cadence_seconds": hardware["loop_seconds"],
-                                       "robot_model": hardware["robot"]["model"],
-                                       "command_delay_seconds": 0.0},
-                            "outcome": "requires_independent_task_annotation",
-                            "reflection_work_scope": "host_interval_held_force_estimate_from_received_master_velocity",
-                            "passivity_scope": "measured trace only; no hardware passivity assertion"})
+                    cleanup_errors.append(str(exc))
+        write_json(output, {"schema_version": 3, "provenance": "UR10_workstation_measurement",
+            "session_id": session_id, "execute": execute, "condition": condition, "stage": stage,
+            "controller_mode": "manual_bootstrap" if models is None else "trained_physical_control",
+            "scene": Scene.from_dict(hardware["scene"]).to_dict(), "model_hashes": hashes,
+            "samples": samples, "commands": decisions, "startup_samples": startup,
+            "robot_commands": robot.commands if robot is not None else [],
+            "sample_journal": str(output.with_suffix(".samples") / "samples.jsonl"),
+            "gripper_commands": grip.events if grip is not None else [], "task_events": task.events,
+            "stop_reason": stop_reason, "error": error_record, "cleanup_errors": cleanup_errors,
+            "acquisition_started_host_monotonic": started, "trial_started_host_monotonic": trial_start,
+            "acquisition_started_utc": acquisition_started_utc,
+            "task_outcome": "requires_independent_annotation", "passivity": engine.diagnostics(),
+            "execution_contract": {"maximum_seconds": hardware["maximum_seconds"],
+                "robot_radius_m": c["task"]["robot_radius"], "place_tolerance_m": c["task"]["place_tolerance"],
+                "workspace_min_m": limits["workspace_min_m"], "workspace_max_m": limits["workspace_max_m"]},
+            "timing": {"feedback_delay_seconds": hardware["feedback_delay_seconds"],
+                "command_delay_seconds": 0., "feedback_channels": ["displayed_RGBD", "cartesian_state", "wrench"],
+                "feedback_definition": "one_way_host_buffer_with_paired_video_presentation_acknowledgement",
+                "nominal_cadence_seconds": period, "requested_master_period_seconds": hardware["master"]["servo_seconds"],
+                "robot_model": hardware["robot"]["model"], "hard_realtime_asserted": False,
+                "scene_mode": hardware["camera"]["scene_mode"],
+                "camera_timestamp_definition": "host_frame_receipt_with_retained_sensor_clock_timestamps"}})
         if cleanup_errors and not unwinding:
-            raise RuntimeError("Workstation device cleanup reported an error")
+            raise RuntimeError("Device cleanup reported errors; retain the recorded diagnostics")
 
 
 def import_recording(recording: Path, annotations: Path, output: Path):
     data = json.loads(recording.read_text())
     metadata = json.loads(annotations.read_text())
+    if metadata.get("source_recording_sha256") != hashlib.sha256(recording.read_bytes()).hexdigest():
+        raise ValueError("The independently annotated recording has changed")
+    if metadata.get("stage") != data.get("stage"):
+        raise ValueError("Acquisition stage conflicts with its annotation")
     for field in ("episode_id", "operator_id", "intended_goal", "success", "collision", "placed",
                   "bounds_violation", "source_condition", "delay_seconds"):
         if metadata.get(field) is None:
@@ -342,6 +404,9 @@ def import_recording(recording: Path, annotations: Path, output: Path):
     metadata["source_recording"] = str(recording)
     metadata["source_recording_sha256"] = hashlib.sha256(recording.read_bytes()).hexdigest()
     metadata["hardware_timing"] = timing
+    metadata["acquisition_started_utc"] = data["acquisition_started_utc"]
+    metadata["observed_minimum_surface_clearance_m"] = float(min(s["minimum_clearance_m"] for s in samples))
+    metadata["reference_definition"] = "unaltered_causal_LQT_reference_at_each_recorded_robot_decision"
     if "execution_contract" in data:
         metadata["execution_contract"] = data["execution_contract"]
     metadata["feedback_timing_audit"] = {
@@ -369,6 +434,15 @@ def import_recording(recording: Path, annotations: Path, output: Path):
                       master_sequence=np.asarray([sample["master_sequence"] for sample in samples],
                                                  dtype=np.int64),
                       executed=np.asarray([sample["executed"] for sample in samples], dtype=bool))
+        if all(isinstance(sample.get("decision"), dict) and "reference" in sample["decision"] for sample in samples):
+            arrays["reference"] = np.asarray([sample["decision"]["reference"] for sample in samples], float)
+            arrays["reference_velocity"] = np.asarray([sample["decision"]["reference_velocity"] for sample in samples], float)
+            arrays["reference_time"] = np.asarray([sample["time"] for sample in samples], float)
+        arrays["measured_wrench"] = np.asarray([sample["measured_wrench"] for sample in samples], float)
+        arrays["executed_force"] = np.asarray([sample["executed_force"] for sample in samples], float)
+        arrays["surface_clearance_m"] = np.asarray([sample["minimum_clearance_m"] for sample in samples], float)
+        if any(sample.get("scene") is not None for sample in samples):
+            arrays["scene_json"] = np.asarray([json.dumps(sample["scene"]) for sample in samples])
         np.savez_compressed(temporary, **arrays)
         temporary.replace(output)
     finally:

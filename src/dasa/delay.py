@@ -41,7 +41,3 @@ class DelayBuffer:
                 break
         self.last_stamp = sample[0]
         return Observation(sample[0], time, sample[1].copy())
-
-
-def sampled_delay(base: float, jitter: float, rng: np.random.Generator) -> float:
-    return max(0.0, base + rng.uniform(-jitter, jitter))

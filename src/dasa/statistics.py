@@ -1,5 +1,4 @@
 import hashlib
-import itertools
 
 import numpy as np
 
@@ -45,18 +44,26 @@ def paired_inference(left, right, seed: int, bootstrap=5000, permutations=20000)
                 "effect_dz_ci95": None, "test": "insufficient_independent_units",
                 "permutations_used": 0, "monte_carlo_standard_error": None}
     rng = np.random.default_rng(seed)
-    if n <= 18:
-        signs = np.array(list(itertools.product((-1, 1), repeat=n)), dtype=np.int8)
-        distribution = np.abs(signs @ difference / n)
-        p = np.mean(distribution >= abs(difference.mean()) - 1e-12)
+    observed = abs(difference.mean())
+    tolerance = 16 * np.finfo(float).eps * max(observed, float(np.max(np.abs(difference))))
+    if n <= 20:
+        permutations_used, exceedances = 1 << n, 0
+        shifts = np.arange(n, dtype=np.uint64)
+        for start in range(0, permutations_used, 4096):
+            codes = np.arange(start, min(start + 4096, permutations_used), dtype=np.uint64)
+            signs = 2 * ((codes[:, None] >> shifts) & 1).astype(np.int8) - 1
+            distribution = np.abs(signs @ difference / n)
+            exceedances += int(np.count_nonzero(distribution >= observed - tolerance))
+        p = exceedances / permutations_used
         test = "exact_paired_sign_permutation"
         mc_se = None
     else:
         signs = rng.choice((-1, 1), size=(permutations, n))
         distribution = np.abs(signs @ difference / n)
-        p = (1 + np.sum(distribution >= abs(difference.mean()) - 1e-12)) / (permutations + 1)
+        p = (1 + np.sum(distribution >= observed - tolerance)) / (permutations + 1)
         test = "monte_carlo_paired_sign_permutation"
         mc_se = float(np.sqrt(p * (1 - p) / (permutations + 1)))
+        permutations_used = permutations
     sampled = difference[rng.integers(0, n, size=(bootstrap, n))]
     boot = sampled.mean(1)
     std = difference.std(ddof=1)
@@ -68,7 +75,10 @@ def paired_inference(left, right, seed: int, bootstrap=5000, permutations=20000)
             "effect_dz": float(difference.mean() / std) if std > 1e-12 else None,
             "effect_dz_ci95": effect_ci, "test": test,
             "effect_bootstrap_degenerate_samples": int(np.sum(boot_std <= 1e-12)),
-            "permutations_used": len(distribution), "monte_carlo_standard_error": mc_se,
+            "permutations_used": permutations_used, "monte_carlo_standard_error": mc_se,
+            "nonzero_paired_differences": int(np.count_nonzero(difference)),
+            "minimum_attainable_raw_p": min(1., 2. / 2 ** int(np.count_nonzero(difference)))
+            if n <= 20 else 1. / (permutations + 1),
             "bootstrap_resampling_unit": "paired_independent_unit"}
 
 

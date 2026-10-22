@@ -1,12 +1,12 @@
-simulation:
+task:
   feedback_delay: 0.8
   command_delay: 0.0
 skill:
-  refinement_count: 20
+  refinement_count: 30
   original_weight: 1.0
   new_weight: 1.0
 experiments:
   independent_repeats: 10
   autonomy_trials: 100
   scenarios: [demonstrated, novel]
-  refinement_budgets: [0, 5, 10, 20]
+  refinement_budgets: [0, 5, 10, 20, 30]

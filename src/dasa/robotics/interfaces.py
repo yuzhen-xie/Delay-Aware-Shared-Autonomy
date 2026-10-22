@@ -27,7 +27,8 @@ class RobotState:
 
 
 class URRTDE:
-    def __init__(self, host: str, execute: bool = False, maximum_speed: float = 0.08):
+    def __init__(self, host: str, execute: bool = False, maximum_speed: float = 0.08,
+                 model: str = "UR10", force_limit: float = 18.0):
         if not isinstance(host, str) or not host.strip() or not np.isfinite(maximum_speed) or maximum_speed <= 0:
             raise ValueError("Robot host and a positive finite maximum speed are required")
         try:
@@ -35,15 +36,21 @@ class URRTDE:
         except ImportError as exc:
             raise RuntimeError("Install the workstation dependency ur-rtde before connecting") from exc
         self.receive, self.control, self.closed = None, None, False
+        if model not in {"UR10", "UR10e"} or not np.isfinite(force_limit) or force_limit <= 0:
+            raise ValueError("An explicit supported robot model and positive wrench limit are required")
         self.execute, self.maximum_speed = execute, maximum_speed
+        self.model, self.force_limit = model, force_limit
+        self.frequency = 125.0 if model == "UR10" else 500.0
+        self.force_active = False
+        self.speed_active = False
         self.commands = []
         try:
-            self.receive = rtde_receive.RTDEReceiveInterface(host)
+            self.receive = rtde_receive.RTDEReceiveInterface(host, self.frequency)
             if hasattr(self.receive, "isConnected") and not self.receive.isConnected():
                 raise ConnectionError("The RTDE receive connection was not established")
             if execute:
                 import rtde_control
-                self.control = rtde_control.RTDEControlInterface(host)
+                self.control = rtde_control.RTDEControlInterface(host, self.frequency)
                 if hasattr(self.control, "isConnected") and not self.control.isConnected():
                     raise ConnectionError("The RTDE control connection was not established")
         except BaseException:
@@ -56,16 +63,22 @@ class URRTDE:
     def state(self) -> RobotState:
         if self.closed:
             raise RuntimeError("The RTDE connection is closed")
-        pose = np.asarray(self.receive.getActualTCPPose(), float)
-        velocity = np.asarray(self.receive.getActualTCPSpeed(), float)
-        wrench = np.asarray(self.receive.getActualTCPForce(), float)
-        joints = np.asarray(self.receive.getActualQ(), float)
-        stamp = float(self.receive.getTimestamp())
+        for _ in range(4):
+            before = float(self.receive.getTimestamp())
+            pose = np.asarray(self.receive.getActualTCPPose(), float)
+            velocity = np.asarray(self.receive.getActualTCPSpeed(), float)
+            wrench = np.asarray(self.receive.getActualTCPForce(), float)
+            joints = np.asarray(self.receive.getActualQ(), float)
+            safety = int(self.receive.getSafetyMode())
+            stamp = float(self.receive.getTimestamp())
+            if before == stamp:
+                break
+        else:
+            raise RuntimeError("Could not obtain a coherent measured RTDE sample")
         if (any(value.shape != (6,) or not np.isfinite(value).all()
                 for value in (pose, velocity, wrench, joints)) or not np.isfinite(stamp) or stamp < 0):
             raise ValueError("RTDE returned invalid measured robot state")
-        return RobotState(stamp, pose[:3], pose[3:], velocity[:3], wrench, joints,
-                          int(self.receive.getSafetyMode()))
+        return RobotState(stamp, pose[:3], pose[3:], velocity[:3], wrench, joints, safety)
 
     def speed(self, velocity, duration: float, enabled: bool):
         velocity = np.asarray(velocity, float)
@@ -80,6 +93,7 @@ class URRTDE:
             return False
         executed = False
         if self.execute:
+            self.speed_active = True
             executed = bool(self.control.speedL(np.r_[velocity, np.zeros(3)].tolist(), 0.3, duration))
             if not executed:
                 self.stop()
@@ -89,7 +103,68 @@ class URRTDE:
 
     def stop(self):
         if self.control is not None:
-            self.control.speedStop(0.5)
+            active = self.force_active or self.speed_active
+            if self.force_active:
+                if not self.control.forceModeStop():
+                    raise RuntimeError("The controller did not acknowledge force-mode stop")
+                self.force_active = False
+            if active:
+                if not self.control.speedStop(0.5):
+                    raise RuntimeError("The controller did not acknowledge Cartesian stop")
+                self.speed_active = False
+
+    def configure_tool(self, tcp_pose, payload_mass, payload_cog, damping=.1, gain=.5):
+        pose, cog = np.asarray(tcp_pose, float), np.asarray(payload_cog, float)
+        if (pose.shape != (6,) or cog.shape != (3,)
+                or not np.isfinite(np.r_[pose, cog, payload_mass, damping, gain]).all()
+                or payload_mass < 0 or not 0 <= damping <= 1 or not 0 < gain <= 1):
+            raise ValueError("Measured tool TCP, payload and bounded force-mode gains are required")
+        if self.execute:
+            operations = [self.control.setTcp(pose.tolist()),
+                          self.control.setPayload(float(payload_mass), cog.tolist()),
+                          self.control.forceModeSetDamping(float(damping)),
+                          self.control.forceModeSetGainScaling(float(gain))]
+            if not all(operations):
+                raise RuntimeError("The controller did not acknowledge the measured tool/force configuration")
+
+    def configure_watchdog(self, maximum_hold_seconds):
+        if not np.isfinite(maximum_hold_seconds) or maximum_hold_seconds <= 0:
+            raise ValueError("The controller watchdog interval must be positive")
+        if self.execute:
+            native_deadline = maximum_hold_seconds - 1.0 / self.frequency
+            if native_deadline <= 0:
+                raise ValueError("The reserved hold must include at least one native controller tick")
+            if not self.control.setWatchdog(1.0 / native_deadline):
+                raise RuntimeError("The controller did not acknowledge its command watchdog")
+
+    def force(self, wrench, duration: float, enabled: bool):
+        force = np.asarray(wrench, float)
+        if (force.shape != (3,) or not np.isfinite(force).all()
+                or not np.isfinite(duration) or duration < 1 / self.frequency - 1e-9):
+            raise ValueError("Force commands require finite translational wrench and native-rate period")
+        state = self.state()
+        if self.execute:
+            if not self.control.kickWatchdog():
+                self.stop()
+                raise RuntimeError("The native controller heartbeat was not acknowledged")
+        if not enabled or state.safety_mode != 1:
+            self.stop()
+            return False
+        force = clamp_norm(force, self.force_limit)
+        executed = False
+        sent_at = time.monotonic()
+        if self.execute:
+            self.force_active = True
+            executed = bool(self.control.forceMode(
+                [0.] * 6, [1, 1, 1, 0, 0, 0], np.r_[force, np.zeros(3)].tolist(), 2,
+                [self.maximum_speed / np.sqrt(3)] * 3 + [.03] * 3))
+            if not executed:
+                self.stop()
+        self.commands.append({"timestamp": state.timestamp, "force_N": force.tolist(),
+                              "duration": duration, "executed": executed,
+                              "host_send_monotonic": sent_at, "host_return_monotonic": time.monotonic(),
+                              "mode": "base_frame_translational_force"})
+        return executed
 
     def close(self):
         if self.closed:
@@ -182,13 +257,13 @@ class MasterUDP:
         selected["foreign_peer_packets"] = foreign
         return selected, selected_address
 
-    def reflect_force(self, force, address, feedback=None):
+    def reflect_force(self, force, address, feedback=None, energy_packet=None):
 
         force = np.asarray(force, float)
         if force.shape != (3,) or not np.isfinite(force).all():
             raise ValueError("Reflected force must be a finite 3D vector")
         packet = {"sequence": self.last_sequence, "reflected_force_N": force.tolist(),
-                  "feedback": feedback}
+                  "feedback": feedback, "energy_packet": energy_packet}
         self.socket.sendto(json.dumps(packet).encode(), address)
 
     def close(self):

@@ -29,18 +29,24 @@ def _host(host) -> str:
 
 
 def default_profile(config: dict) -> dict:
-    return {"schema_version": 2, "robot": {"model": "UR10"}, "master": {"udp_port": 55001},
+    return {"schema_version": 3, "robot": {"model": "UR10", "mode": "force"},
+            "master": {"udp_port": 55001, "servo_seconds": .001},
             "gripper": {"type": "robotiq_socket", "port": 63352, "speed": 64,
                         "force": 64, "timeout_seconds": 1.0},
-            "loop_seconds": .02, "maximum_seconds": float(config.get("study", {}).get("max_seconds", 60.)),
-            "feedback_delay_seconds": float(config["simulation"]["feedback_delay"]),
+            "loop_seconds": .008, "maximum_seconds": float(config.get("study", {}).get("max_seconds", 60.)),
+            "feedback_delay_seconds": float(config["task"]["feedback_delay"]),
+            "camera": {"source": "realsense", "width": 640, "height": 480, "fps": 30,
+                       "maximum_age_seconds": .2, "scene_mode": "static_once",
+                       "history_seconds": 5., "maximum_pairing_skew_seconds": .1},
+            "video": {"host": "127.0.0.1", "port": 55002},
+            "force_mode": {"damping": .1, "gain": .5},
             "limits": {"maximum_speed_m_s": .08, "maximum_master_force_N": 12.,
                        "maximum_reflection_force_N": 2., "watchdog_seconds": .10,
                        "feedback_acknowledgement_seconds": .10, "calibration_rms_m": .005,
                        "minimum_jacobian_singular_value": .02, "obstacle_margin_m": .04,
                        "start_tolerance_m": .05,
-                       "workspace_min_m": copy.deepcopy(config["simulation"]["workspace_min"]),
-                       "workspace_max_m": copy.deepcopy(config["simulation"]["workspace_max"])}}
+                       "workspace_min_m": copy.deepcopy(config["task"]["workspace_min"]),
+                       "workspace_max_m": copy.deepcopy(config["task"]["workspace_max"])}}
 
 
 def _scene_geometry(scene: Scene) -> None:
@@ -97,6 +103,9 @@ def validate_hardware(hardware: dict, base: Path | None = None) -> dict:
         _host(data["robot"]["host"])
         if data["robot"]["model"] not in {"UR10", "UR10e"}:
             raise ValueError("Robot model must be UR10 or UR10e")
+        native_period = .008 if data["robot"]["model"] == "UR10" else .002
+        if data["robot"].get("mode") != "force" or data["loop_seconds"] < native_period - 1e-9:
+            raise ValueError("Force-mode cadence must respect the selected robot's native rate")
         for port in [data["master"]["udp_port"], data["gripper"]["port"]]:
             if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
                 raise ValueError("Device ports must be integers in 1..65535")
@@ -156,7 +165,27 @@ def validate_hardware(hardware: dict, base: Path | None = None) -> dict:
         elif scene.provenance == "calibrated_rgbd_geometry":
             raise ValueError("RGB-D scenes require their linked perception snapshot")
         data["scene"] = scene.to_dict()
-        data.setdefault("schema_version", 2)
+        tool = data["tool"]
+        pose, cog = np.asarray(tool["tcp_pose"], float), np.asarray(tool["payload_cog_m"], float)
+        if (pose.shape != (6,) or cog.shape != (3,) or tool["payload_mass_kg"] < 0
+                or not np.isfinite(np.r_[pose, cog, tool["payload_mass_kg"]]).all()):
+            raise ValueError("Measured tool TCP and payload must be finite and dimensionally valid")
+        camera = data["camera"]
+        if (camera["source"] != "realsense" or camera["scene_mode"] not in {"static_once", "online"}
+                or not 1 <= data["video"]["port"] <= 65535 or camera["maximum_age_seconds"] <= 0):
+            raise ValueError("A live calibrated RGB-D camera and valid video endpoint are required")
+        for key in ("perception_record", "tool_record"):
+            source = Path(data[key])
+            if not source.is_absolute():
+                source = base / source
+            source = source.resolve(strict=True)
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            if data.get(key + "_sha256", digest) != digest:
+                raise ValueError(f"Changed commissioned input: {key}")
+            data[key], data[key + "_sha256"] = str(source), digest
+        if json.loads(Path(data["tool_record"]).read_text(encoding="utf-8")) != tool:
+            raise ValueError("Tool configuration differs from its measured input record")
+        data.setdefault("schema_version", 3)
     except KeyError as exc:
         raise ValueError(f"Missing required hardware input: {exc.args[0]}") from exc
     return data
@@ -169,7 +198,9 @@ def load_hardware(path: str | Path) -> dict:
 
 def configure(config: dict, host: str, calibration_path: str | Path,
               scene_snapshot_path: str | Path, output: str | Path, model: str = "UR10",
-              gripper: str = "robotiq_socket", profile_path: str | Path | None = None) -> dict:
+              gripper: str = "robotiq_socket", profile_path: str | Path | None = None,
+              perception_path: str | Path | None = None,
+              tool_path: str | Path | None = None) -> dict:
     host = _host(host)
     hardware = default_profile(config)
     if profile_path is not None:
@@ -179,10 +210,20 @@ def configure(config: dict, host: str, calibration_path: str | Path,
     calibration = load_calibration(calibration_path, hardware["limits"]["calibration_rms_m"])
     snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
     scene = _snapshot_scene(snapshot, calibration)
+    if perception_path is None or tool_path is None:
+        raise ValueError("Supply measured tool and calibrated live-perception specification files")
+    perception_path, tool_path = (Path(path).resolve(strict=True)
+                                  for path in (perception_path, tool_path))
     hardware["robot"].update(host=_host(host), model=model)
+    hardware["loop_seconds"] = max(hardware["loop_seconds"], .008 if model == "UR10" else .002)
+    if profile_path is None and model == "UR10e":
+        hardware["loop_seconds"] = .002
     hardware["gripper"]["type"] = gripper
     hardware.update(calibration_record=str(calibration_path), snapshot_record=str(snapshot_path),
-                    scene=scene.to_dict())
+                    scene=scene.to_dict(), perception_record=str(perception_path),
+                    tool_record=str(tool_path), tool=json.loads(tool_path.read_text(encoding="utf-8")))
+    hardware["camera"].update(calibration_record=str(calibration_path),
+                               perception_record=str(perception_path))
     hardware = validate_hardware(hardware)
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)

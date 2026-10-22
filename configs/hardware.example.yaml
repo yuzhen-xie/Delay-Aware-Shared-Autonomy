@@ -1,23 +1,40 @@
-schema_version: 2
+schema_version: 3
 robot:
   model: UR10
+  mode: force
 master:
   udp_port: 55001
+  servo_seconds: 0.001
+video:
+  host: 127.0.0.1
+  port: 55002
+camera:
+  source: realsense
+  width: 640
+  height: 480
+  fps: 30
+  scene_mode: static_once
+  history_seconds: 5.0
+  maximum_age_seconds: 0.2
+  maximum_pairing_skew_seconds: 0.1
 gripper:
   type: robotiq_socket
   port: 63352
   speed: 64
   force: 64
   timeout_seconds: 1.0
-loop_seconds: 0.02
+loop_seconds: 0.008
 maximum_seconds: 60.0
 feedback_delay_seconds: 0.8
+force_mode:
+  damping: 0.1
+  gain: 0.5
 limits:
   maximum_speed_m_s: 0.08
   maximum_master_force_N: 12.0
   maximum_reflection_force_N: 2.0
   watchdog_seconds: 0.10
-  feedback_acknowledgement_seconds: 0.10
+  feedback_acknowledgement_seconds: 0.15
   calibration_rms_m: 0.005
   minimum_jacobian_singular_value: 0.02
   obstacle_margin_m: 0.04

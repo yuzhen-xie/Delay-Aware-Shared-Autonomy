@@ -1,12 +1,18 @@
-param([ValidateSet("smoke", "full")][string]$Profile = "smoke")
+param(
+    [Parameter(Mandatory = $true)][string]$Schedule,
+    [Parameter(Mandatory = $true)][string]$Hardware,
+    [Parameter(Mandatory = $true)][string]$Models,
+    [Parameter(Mandatory = $true)][string]$Participant,
+    [Parameter(Mandatory = $true)][string]$TrialId,
+    [Parameter(Mandatory = $true)][string]$Output,
+    [switch]$Execute
+)
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 $Python = ".venv\Scripts\python.exe"
-$RunPath = "artifacts\" + $Profile + "-" + (Get-Date -Format "yyyyMMdd-HHmmss")
-if ($Profile -eq "smoke") {
-    & $Python -m dasa.cli --profile configs/smoke.yaml run --output $RunPath
-} else {
-    & $Python -m dasa.cli run --output $RunPath
-}
-if ($LASTEXITCODE -ne 0) { throw "Experiment failed: $LASTEXITCODE" }
-Write-Host "Report: $RunPath\report\index.html"
+$Arguments = @("-m", "dasa.cli", "hardware-trial", $Schedule, "--hardware", $Hardware,
+               "--models", $Models, "--participant", $Participant, "--trial-id", $TrialId,
+               "--output", $Output)
+if ($Execute) { $Arguments += "--execute" }
+& $Python @Arguments
+if ($LASTEXITCODE -ne 0) { throw "Acquisition failed: $LASTEXITCODE" }

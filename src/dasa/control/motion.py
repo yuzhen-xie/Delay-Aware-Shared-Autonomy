@@ -5,16 +5,21 @@ from dasa.geometry import Scene, clamp_norm
 
 class ForceKalman:
 
-    def __init__(self, process: float, measurement: float, initial_variance: float = 1.0):
-        if process < 0 or measurement <= 0 or initial_variance <= 0:
+    def __init__(self, process: float, measurement: float, initial_variance: float = 1.0,
+                 nominal_seconds: float = .008):
+        if process < 0 or measurement <= 0 or initial_variance <= 0 or nominal_seconds <= 0:
             raise ValueError("Kalman Q must be nonnegative; R and initial variance must be positive")
         self.mean = np.zeros(3)
         self.covariance = initial_variance * np.eye(3)
         self.q = process * np.eye(3)
         self.r = measurement * np.eye(3)
+        self.nominal_seconds = nominal_seconds
 
-    def step(self, measurement: np.ndarray):
-        predicted = self.covariance + self.q
+    def step(self, measurement: np.ndarray, seconds: float | None = None):
+        seconds = self.nominal_seconds if seconds is None else seconds
+        if not np.isfinite(seconds) or seconds <= 0:
+            raise ValueError("The force observation interval must be positive")
+        predicted = self.covariance + self.q * seconds / self.nominal_seconds
         gain = np.linalg.solve((predicted + self.r).T, predicted.T).T
         self.mean += gain @ (measurement - self.mean)
         residual = np.eye(3) - gain

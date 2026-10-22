@@ -5,6 +5,8 @@ import hashlib
 import json
 import platform
 import subprocess
+import os
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -41,19 +43,17 @@ def validate(c: dict) -> None:
         return bool(np.isfinite(value)) if isinstance(value, (float, int)) else True
     if not finite_tree(c):
         raise ValueError("Configuration contains a non-finite numeric value")
-    sim = c["simulation"]
-    dt, decision = sim["control_dt"], sim["decision_dt"]
-    if dt <= 0 or decision < dt or not np.isclose(decision / dt, round(decision / dt)):
-        raise ValueError("decision_dt must be a positive integer multiple of control_dt")
-    if sim["mass"] <= 0 or sim["damping"] < 0:
-        raise ValueError("Invalid plant mass or damping")
-    for field in ("feedback_delay", "command_delay", "jitter_seconds"):
-        if sim[field] < 0:
+    task = c["task"]
+    dt, decision = task["control_dt"], task["decision_dt"]
+    if dt <= 0 or decision <= 0:
+        raise ValueError("Device and decision sampling periods must be positive")
+    for field in ("feedback_delay", "command_delay"):
+        if task[field] < 0:
             raise ValueError(f"{field} must be nonnegative")
     if c["motion"]["distance_max"] <= c["motion"]["distance_min"]:
         raise ValueError("Collision-distance thresholds must be ordered")
     for section, fields in {
-        "simulation": ("max_seconds", "robot_radius", "force_limit", "grasp_tolerance",
+        "task": ("max_seconds", "robot_radius", "force_limit", "grasp_tolerance",
                        "place_tolerance", "dwell_seconds", "max_grasp_speed"),
         "motion": ("repulsive_sigma", "repulsive_limit", "lambda_gain", "kalman_measurement",
                    "kalman_initial_variance"),
@@ -75,17 +75,21 @@ def validate(c: dict) -> None:
     for field in ("fixed_weight", "guarded_corrective_max"):
         if not 0 <= c["arbitration"].get(field, .5) <= 1:
             raise ValueError(f"{field} must lie in [0, 1]")
-    lower, upper = np.asarray(sim["workspace_min"]), np.asarray(sim["workspace_max"])
+    lower, upper = np.asarray(task["workspace_min"]), np.asarray(task["workspace_max"])
     if lower.shape != (3,) or upper.shape != (3,) or np.any(lower >= upper):
         raise ValueError("Workspace bounds must be ordered 3-vectors")
-    p = c["passivity"]
-    if not 0 <= p["initial_energy"] <= p["maximum_energy"]:
-        raise ValueError("Invalid initial energy budget")
-    if not 0 <= p["input_efficiency"] <= 1:
-        raise ValueError("Energy input efficiency must lie in [0, 1]")
+    p = c["passivity"]["physical"]
+    for port in ("master", "robot", "autonomy"):
+        if not 0 <= p[port + "_initial_energy_j"] <= p[port + "_maximum_energy_j"]:
+            raise ValueError("Physical port storage bounds must be finite and ordered")
+    for port in ("master", "robot"):
+        if p[port + "_maximum_hold_seconds"] <= 0 or p[port + "_speed_bound_m_s"] <= 0:
+            raise ValueError("Physical port reservations need positive hold and velocity bounds")
+        if not 0 <= p[port + "_energy_export_fraction"] <= 1:
+            raise ValueError("Exported energy fractions must lie in [0,1]")
     goals = np.asarray(c["scene"]["goals"], dtype=float)
     if goals.shape != (3, 3) or not np.isfinite(goals).all():
-        raise ValueError("This benchmark requires three finite 3D candidate goals")
+        raise ValueError("The task requires three finite 3D candidate goals")
     if c["intent"]["hidden_dim"] % c["intent"]["transformer_heads"]:
         raise ValueError("Transformer dimension must be divisible by its head count")
     if c["intent"]["deviation_objective"] not in {"auxiliary", "joint"}:
@@ -107,16 +111,18 @@ def validate(c: dict) -> None:
         raise ValueError("Each HSMM state needs at least one time sample")
     if c["intent"]["epochs"] < 1:
         raise ValueError("At least one training epoch is required")
-    if "bootstrap" in c:
-        speed = c["bootstrap"]["cruise_speed_m_s"]
-        if len(speed) != 2 or not 0 < speed[0] <= speed[1]:
-            raise ValueError("Bootstrap speed range must be positive and ordered")
-    budgets = c["experiments"].get("refinement_budgets", [0, 5, 10, 20])
+    budgets = c["experiments"].get("refinement_budgets", [0, 5, 10, 20, 30])
     if any(not isinstance(b, int) or b < 0 for b in budgets) or len(set(budgets)) != len(budgets):
         raise ValueError("Refinement budgets must be distinct nonnegative integers")
     study = c.get("study", {})
     if study.get("participants", 20) < 1:
         raise ValueError("Invalid planned study cohort counts")
+    if c["experiments"]["bootstrap_demonstrations"] != 50:
+        raise ValueError("Initial intent training requires exactly 50 measured demonstrations")
+    if c["skill"]["refinement_count"] != 30:
+        raise ValueError("The full refinement comparison requires 30 accepted demonstrations")
+    if c["intent"].get("latent_inference", "sample") not in {"sample", "mean"}:
+        raise ValueError("Unknown latent inference rule")
 
 
 def seed_everything(seed: int) -> None:
@@ -135,7 +141,15 @@ def write_json(path: str | Path, value) -> None:
         if isinstance(obj, np.generic):
             return obj.item()
         raise TypeError(type(obj).__name__)
-    path.write_text(json.dumps(value, indent=2, default=default, allow_nan=False), encoding="utf-8")
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, default=default, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def manifest(config: dict, command: str, inputs: list[Path] | None = None) -> dict:

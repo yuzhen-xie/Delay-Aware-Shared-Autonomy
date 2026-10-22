@@ -2,9 +2,10 @@ intent:
   objective: joint_elbo
   kl_weight: 1.0
   deviation_weight: 1.0
+  latent_inference: sample
   epochs: 35
 experiments:
   intent_delays: [0.0, 0.4, 0.8, 1.5]
-  bootstrap_demonstrations: 20
+  bootstrap_demonstrations: 50
   validation_demonstrations: 6
   test_demonstrations: 12

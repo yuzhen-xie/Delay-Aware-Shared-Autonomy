@@ -1,10 +1,9 @@
+schema_version: 3
 seed: 20261014
-simulation:
+task:
   control_dt: 0.001
-  decision_dt: 0.02
-  max_seconds: 18.0
-  mass: 1.2
-  damping: 12.0
+  decision_dt: 0.008
+  max_seconds: 60.0
   robot_radius: 0.025
   force_limit: 18.0
   workspace_min: [0.02, -0.55, 0.02]
@@ -12,13 +11,12 @@ simulation:
   grasp_tolerance: 0.045
   place_tolerance: 0.055
   dwell_seconds: 0.16
-  max_grasp_speed: 0.18
+  max_grasp_speed: 0.08
   lift_height: 0.48
   feedback_delay: 0.8
   command_delay: 0.0
-  jitter_seconds: 0.0
 scene:
-  provenance: known_scene_simulation
+  provenance: prescribed_layout
   frame: base
   goals: [[0.56, -0.25, 0.12], [0.64, 0.0, 0.12], [0.55, 0.24, 0.12]]
   place: [0.80, 0.29, 0.12]
@@ -26,8 +24,8 @@ scene:
   obstacles:
     - {id: center, center: [0.43, 0.0, 0.23], radius: 0.075}
     - {id: left, center: [0.35, -0.28, 0.19], radius: 0.060}
-  training_translation: 0.025
   novel_translation: [0.05, 0.15]
+  perturbation_definition: Euclidean_xy_displacement_m
   added_obstacle_radius: 0.055
   object_size_m: [0.04, 0.04, 0.06]
 motion:
@@ -58,10 +56,23 @@ arbitration:
   fixed_weight: 0.5
   guarded_corrective_max: 0.15
 passivity:
-  initial_energy: 1.0
-  maximum_energy: 8.0
-  input_efficiency: 0.9
-  tolerance: 0.00000001
+  physical:
+    master_initial_energy_j: 0.05
+    robot_initial_energy_j: 0.95
+    master_maximum_energy_j: 2.0
+    robot_maximum_energy_j: 8.0
+    master_speed_bound_m_s: 1.0
+    robot_speed_bound_m_s: 0.08
+    master_maximum_hold_seconds: 0.005
+    robot_maximum_hold_seconds: 0.024
+    master_energy_export_fraction: 0.5
+    robot_energy_export_fraction: 0.5
+    maximum_credit_increment_j: 8.0
+    coordination_guard_energy_j: 0.05
+    autonomy_initial_energy_j: 0.25
+    autonomy_maximum_energy_j: 2.0
+    autonomy_coordination_gain: 1.0
+    tolerance_j: 0.00000001
 intent:
   beta: 3.0
   confidence_threshold: 0.6
@@ -79,6 +90,9 @@ intent:
   kl_weight: 1.0
   deviation_weight: 1.0
   deviation_objective: joint
+  latent_inference: sample
+  classifier_latent_draws: 4
+  classifier_validation_draws: 8
 skill:
   states: 7
   trajectory_samples: 140
@@ -88,47 +102,71 @@ skill:
   lqt_control_cost: 0.01
   original_weight: 1.0
   new_weight: 1.0
-  refinement_count: 20
-  online_filter: false
-  goal_search_fraction: 0.60
-  goal_index_floor: 4
-  lift_segment_fraction: 0.22
-  lookahead_samples: 5
-  progress_advance_samples: 3
-  proximity_threshold_m: 0.035
-  goal_snap_samples: 4
-  place_snap_samples: 9
-  place_snap_distance_m: 0.05
-bootstrap:
-  segment_min_seconds: 0.45
-  cruise_speed_m_s: [0.16, 0.24]
-  minimum_segment_samples: 12
-  lateral_std_m: 0.008
-  force_noise_std_N: 0.15
-operator:
-  kp: 26.0
-  kd: 7.0
-  expert_noise: 0.15
-  noisy_noise: 0.9
-  corrective_gain: 1.0
+  refinement_count: 30
+  prediction_horizon_samples: 32
 experiments:
+  provenance: physical_robot_measurements
   intent_delays: [0.0, 0.4, 0.8, 1.5]
   sharing_delays: [0.0, 0.4, 0.8, 1.5]
-  conditions: [C1, C2, C3, C4, delay_br_shared, C3_guarded]
-  scenarios: [demonstrated, novel, wider, extra_obstacles]
-  bootstrap_demonstrations: 20
+  conditions: [C1, C2, C3, C4]
+  scenarios: [demonstrated, novel]
+  bootstrap_demonstrations: 50
   validation_demonstrations: 6
   test_demonstrations: 12
-  simulated_operators: 12
-  trials_per_condition: 2
   independent_repeats: 10
   autonomy_trials: 100
   bootstrap_samples: 5000
   permutation_samples: 20000
-  port_bench_steps: 20000
-  refinement_budgets: [0, 5, 10, 20]
+  refinement_budgets: [0, 5, 10, 20, 30]
 study:
   participants: 20
   trial_repeats: 1
   practice_trials: 8
+  practice_sequence: [[C1, 0.0], [C1, 0.0], [C1, 0.0], [C1, 0.0], [C3, 0.0], [C3, 0.0], [C3, 0.0], [C3, 0.0]]
   max_seconds: 60.0
+  hardware_scene_tolerance_m: 0.005
+representation:
+  delay_seconds: 0.4
+  delay_tolerance_seconds: 0.000000001
+  methods: [full, no_latent, no_delay]
+  samples_per_episode: 64
+  samples_per_goal_per_operator: 64
+  required_goals: [0, 1, 2]
+  maximum_tsne_points: 600
+  bootstrap_samples: 5000
+  seed: 20261014
+  tsne:
+    perplexity: 30.0
+    iterations: 1000
+    learning_rate: 200.0
+    early_exaggeration: 12.0
+    early_exaggeration_iterations: 250
+    initialization: pca
+    initial_scale: 0.0001
+    initial_momentum: 0.5
+    final_momentum: 0.8
+    minimum_gain: 0.01
+    entropy_tolerance: 0.00001
+    precision_search_iterations: 80
+analysis:
+  parameter_provenance: configured_operational_values
+  metrics:
+    resample_dt_seconds: 0.01
+    smoothing_window_seconds: 0.11
+    polynomial_order: 3
+    gamma_st_s3_per_m: 1.0
+    gamma_sa_s2_per_m: 1.0
+    steering_speed_definition: TCP_translational_speed_norm_m_per_s
+    distance_definition: obstacle_surface_minus_TCP_radius_m
+    trial_aggregation: duration_weighted_mean
+  questionnaire:
+    scale_min: 1.0
+    scale_max: 7.0
+    performance_direction: higher_is_worse
+    anchors:
+      mental: {low: very_low_mental_demand, high: very_high_mental_demand}
+      physical: {low: very_low_physical_demand, high: very_high_physical_demand}
+      temporal: {low: very_low_time_pressure, high: very_high_time_pressure}
+      performance: {low: perfect_performance, high: task_failure}
+      effort: {low: very_low_effort, high: very_high_effort}
+      frustration: {low: very_low_frustration, high: very_high_frustration}

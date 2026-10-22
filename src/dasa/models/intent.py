@@ -72,6 +72,9 @@ class ConditionalVAE(nn.Module):
         self.deviation_head = nn.Linear(hidden, GOALS)
         self.classifier = nn.Sequential(nn.Linear(CONDITION_DIM + latent, hidden), nn.SiLU(),
                                         nn.Linear(hidden, GOALS))
+        self.context_classifier = nn.Sequential(nn.Linear(CONDITION_DIM, hidden), nn.SiLU(),
+                                                nn.Linear(hidden, GOALS))
+        self.context_prior_trained = False
 
     def encode(self, action, deviation, context):
         h = self.encoder(torch.cat([action, deviation, context], -1))
@@ -140,19 +143,58 @@ def model_spec(config: dict) -> dict:
             "decoder": [CONDITION_DIM + latent, hidden, hidden],
             "decoder_heads": {"action": ACTION_DIM, "deviation": GOALS},
             "goal_classifier": [CONDITION_DIM + latent, hidden, GOALS],
+            "context_only_classifier": [CONDITION_DIM, hidden, GOALS],
             "hidden_activation": "SiLU", "classifier_output": "categorical logits",
             "prior": "independent standard normal coordinates",
-            "initial_inference_latent": "zero prior mean; deterministic inference uses encoder mean",
+            "initial_inference_latent": inference_spec(config)["initial_latent"],
             "action_preprocessing": "unit raw force direction; zero force remains zero",
             "context_preprocessing": "SI units; no dataset normalization or age feature",
             "deviation_preprocessing": "three Euclidean distances to candidate unit references",
-            "classification_latent": "previous observation encoder mean; reset to zero per episode",
+            "classification_latent": "previous posterior draw, with independent prior draw at episode start"
+            if inference_spec(config)["latent_mode"] == "sample" else
+            "previous posterior mean, with zero prior mean at episode start",
+            "context_fields": [
+                {"name": "tcp_position_base", "dimension": 3, "unit": "m"},
+                {"name": "tcp_velocity_base", "dimension": 3, "unit": "m/s"},
+                {"name": "ordered_candidate_goal_displacements", "dimension": 9, "unit": "m"},
+                {"name": "nearest_obstacle_center_displacement", "dimension": 3, "unit": "m"},
+                {"name": "nearest_obstacle_surface_clearance", "dimension": 1, "unit": "m"}],
+            "deviation_definition": "e_G=norm(unit(raw_force)-unit(reference_G)); all candidates in fixed order",
+            "reconstruction_targets": ["unit_action_3", "candidate_deviation_vector_3"],
+            "state_reconstructed": False,
             "lstm": {"input": CONDITION_DIM + ACTION_DIM, "hidden": hidden, "layers": 1},
             "transformer": {"input": CONDITION_DIM + ACTION_DIM, "hidden": hidden,
                             "heads": c["transformer_heads"], "layers": c["transformer_layers"],
                             "feedforward": 2 * hidden, "activation": "ReLU", "dropout": 0.0,
                             "causal_attention": True, "position_embedding_std": 0.02},
             "sequence_window": c["sequence_window"]}
+
+
+def inference_spec(config: dict) -> dict:
+    c = config["intent"]
+    mode = c.get("latent_inference", "sample")
+    if mode not in {"sample", "mean"}:
+        raise ValueError("latent_inference must be sample or mean")
+    seed = c.get("inference_seed", config["seed"])
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("inference_seed must be a nonnegative integer")
+    draws = c.get("classifier_latent_draws", 4)
+    validation_draws = c.get("classifier_validation_draws", 8)
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1
+           for value in (draws, validation_draws)):
+        raise ValueError("Classifier latent draw counts must be positive integers")
+    return {"latent_mode": mode, "seed": seed,
+            "initial_latent": "draw N(0,I)" if mode == "sample" else "zero prior mean",
+            "posterior_latent": "reparameterized diagonal-Gaussian draw" if mode == "sample"
+            else "encoder posterior mean",
+            "classifier_training_draws": draws if mode == "sample" else 1,
+            "classifier_validation_draws": validation_draws if mode == "sample" else 1,
+            "history": "one-step encoded action plus current displayed-state context; not an accumulated full-history posterior",
+            "update_order": "evaluate goal prior, evaluate current likelihood, then update current latent",
+            "no_latent": "trained context-only goal prior times matched delayed-state likelihood",
+            "likelihood_only": "uniform goal prior times matched delayed-state likelihood",
+            "shared_representation": "categorical goal posterior probability; not a latent embedding",
+            "native_latent_representation": "current encoder posterior mean for full and no_delay only"}
 
 
 def _arrays_digest(arrays: dict) -> dict:
@@ -190,14 +232,17 @@ class SequenceClassifier(nn.Module):
             raise ValueError(kind)
         self.head = nn.Linear(hidden, GOALS)
 
-    def forward(self, x):
+    def features(self, x):
         if self.kind == "lstm":
             h, _ = self.network(x)
         else:
             n = x.shape[1]
             mask = torch.triu(torch.ones(n, n, dtype=torch.bool, device=x.device), diagonal=1)
             h = self.network(self.projection(x) + self.position[:, :n], mask=mask)
-        return self.head(h[:, -1])
+        return h[:, -1]
+
+    def forward(self, x):
+        return self.head(self.features(x))
 
 
 def training_arrays(demos: list[Demonstration], skill: TPHSMM, config: dict) -> dict:
@@ -210,7 +255,7 @@ def training_arrays(demos: list[Demonstration], skill: TPHSMM, config: dict) -> 
             state = demo.observed_state[t]
             refs = bank.actions(state)
             actions.append(action)
-            contexts.append(condition(state, demo.scene, config["simulation"]["robot_radius"]))
+            contexts.append(condition(state, demo.scene, config["task"]["robot_radius"]))
             deviations.append(np.linalg.norm(action - refs, axis=1))
             labels.append(demo.goal)
             episodes.append(demo.metadata["episode_id"])
@@ -239,9 +284,21 @@ def previous_latent(mu: torch.Tensor, episode: np.ndarray) -> torch.Tensor:
     return previous
 
 
+def _classifier_previous(mu, logvar, episodes, mode, generator):
+    if mode == "mean":
+        return previous_latent(mu, episodes)
+    noise = torch.randn(mu.shape, generator=generator, dtype=mu.dtype, device=mu.device)
+    posterior = mu + (0.5 * logvar).exp() * noise
+    previous = torch.randn(mu.shape, generator=generator, dtype=mu.dtype, device=mu.device)
+    same = torch.as_tensor(episodes[1:] == episodes[:-1], device=mu.device)
+    previous[1:] = torch.where(same[:, None], posterior[:-1], previous[1:])
+    return previous
+
+
 def train_intent(config: dict, train: dict, validation: dict, output: Path) -> list[dict]:
     c = config["intent"]
     spec = objective_spec(config)
+    inference = inference_spec(config)
     if c["epochs"] < 1 or c["batch_size"] < 1:
         raise ValueError("Training requires positive epochs and batch size")
     for split in (train, validation):
@@ -279,33 +336,66 @@ def train_intent(config: dict, train: dict, validation: dict, output: Path) -> l
                         "objective_identity_error": identity_error, **means})
     model.eval()
     with torch.no_grad():
-        mu, _ = model.encode(tensors["action"], tensors["deviation"], tensors["context"])
-    previous = previous_latent(mu, train["episode"])
+        mu, logvar = model.encode(tensors["action"], tensors["deviation"], tensors["context"])
     optimizer = torch.optim.Adam(model.classifier.parameters(), lr=c["learning_rate"])
     best, best_state = np.inf, None
     validation_t = {k: torch.from_numpy(validation[k]) for k in ("action", "deviation", "context", "label")}
     with torch.no_grad():
-        validation_mu, _ = model.encode(validation_t["action"], validation_t["deviation"], validation_t["context"])
-        validation_previous = previous_latent(validation_mu, validation["episode"])
+        validation_mu, validation_logvar = model.encode(
+            validation_t["action"], validation_t["deviation"], validation_t["context"])
+        validation_generator = torch.Generator().manual_seed(inference["seed"] + 710001)
+        validation_previous = [_classifier_previous(
+            validation_mu, validation_logvar, validation["episode"], inference["latent_mode"],
+            validation_generator) for _ in range(inference["classifier_validation_draws"])]
+    training_generator = torch.Generator().manual_seed(inference["seed"] + 710000)
     for epoch in range(c["epochs"]):
         training_total, training_count = 0.0, 0
+        previous = [_classifier_previous(mu, logvar, train["episode"], inference["latent_mode"],
+                                         training_generator)
+                    for _ in range(inference["classifier_training_draws"])]
         for ix in torch.randperm(len(train["label"])).split(c["batch_size"]):
-            logits = model.classifier(torch.cat([previous[ix], tensors["context"][ix]], -1))
-            loss = nn.functional.cross_entropy(logits, tensors["label"][ix])
+            loss = torch.stack([nn.functional.cross_entropy(model.classifier(torch.cat(
+                [draw[ix], tensors["context"][ix]], -1)), tensors["label"][ix])
+                for draw in previous]).mean()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             training_total += float(loss.detach()) * len(ix)
             training_count += len(ix)
         with torch.no_grad():
-            logits = model.classifier(torch.cat([validation_previous, validation_t["context"]], -1))
-            val = float(nn.functional.cross_entropy(logits, validation_t["label"]))
+            val = float(torch.stack([nn.functional.cross_entropy(model.classifier(torch.cat(
+                [draw, validation_t["context"]], -1)), validation_t["label"])
+                for draw in validation_previous]).mean())
         history.append({"model": "goal_prior", "epoch": epoch,
-                        "training_nll": training_total / training_count, "validation_nll": val})
+                        "training_nll": training_total / training_count, "validation_nll": val,
+                        "latent_mode": inference["latent_mode"],
+                        "validation_draw_policy": "fixed draws shared across checkpoint candidates"})
         if val < best:
             best = val
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
+    optimizer = torch.optim.Adam(model.context_classifier.parameters(), lr=c["learning_rate"])
+    best, best_state = np.inf, None
+    for epoch in range(c["epochs"]):
+        total, count = 0.0, 0
+        for ix in torch.randperm(len(train["label"])).split(c["batch_size"]):
+            loss = nn.functional.cross_entropy(model.context_classifier(tensors["context"][ix]),
+                                                tensors["label"][ix])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total += float(loss.detach()) * len(ix)
+            count += len(ix)
+        with torch.no_grad():
+            val = float(nn.functional.cross_entropy(model.context_classifier(validation_t["context"]),
+                                                    validation_t["label"]))
+        history.append({"model": "context_only_goal_prior", "epoch": epoch,
+                        "training_nll": total / count, "validation_nll": val,
+                        "information_removed": "latent only; context, likelihood and split retained"})
+        if val < best:
+            best, best_state = val, {key: value.clone() for key, value in model.context_classifier.state_dict().items()}
+    model.context_classifier.load_state_dict(best_state)
+    model.context_prior_trained = True
     torch.save(model.state_dict(), output / "cvae.pt")
     for kind in ("lstm", "transformer"):
         network = SequenceClassifier(kind, config)
@@ -335,7 +425,17 @@ def train_intent(config: dict, train: dict, validation: dict, output: Path) -> l
         network.load_state_dict(best_state)
         torch.save(network.state_dict(), output / f"{kind}.pt")
     metadata = {
-        "schema_version": 1, "objective": spec, "architecture": model_spec(config),
+        "schema_version": 2, "objective": spec, "architecture": model_spec(config),
+        "inference": inference,
+        "trained_components": ["cvae", "goal_classifier", "context_only_classifier", "lstm", "transformer"],
+        "classifier_objective": "expected categorical cross entropy over matched lagged latent draws",
+        "validation_latent_policy": "fixed Monte Carlo draws; expected NLL, not negative log averaged probability",
+        "context_only_control": "same episodes, context features, labels, learning rate, epochs and validation-selection rule",
+        "sample_counts": {"train": len(train["label"]), "validation": len(validation["label"])},
+        "goal_sample_counts": {split: {str(goal): int(np.sum(values["label"] == goal))
+                                        for goal in range(GOALS)}
+                               for split, values in (("train", train), ("validation", validation))},
+        "acquisition_provenance": "provided by the enclosing dataset manifest; not inferred from feature arrays",
         "torch_version": str(torch.__version__),
         "randomness": rng_record, "intent_config": c,
         "optimizer": {"name": "Adam", "learning_rate": c["learning_rate"],
@@ -344,6 +444,7 @@ def train_intent(config: dict, train: dict, validation: dict, output: Path) -> l
                       "classifier_gradient_norm_clip": None},
         "epochs": c["epochs"], "batch_size": c["batch_size"],
         "selection": {"cvae": "final training epoch", "goal_classifier": "validation NLL",
+                      "context_only_classifier": "validation NLL on the same validation episodes",
                       "lstm": "validation NLL", "transformer": "validation NLL"},
         "train_arrays": _arrays_digest(train), "validation_arrays": _arrays_digest(validation),
         "train_episode_ids": sorted(set(train["episode"].tolist())),
@@ -358,34 +459,65 @@ def train_intent(config: dict, train: dict, validation: dict, output: Path) -> l
 
 class IntentEstimator:
     def __init__(self, config: dict, bank: ReferenceBank, model: ConditionalVAE | None,
-                 kind: str = "full", network: SequenceClassifier | None = None):
+                 kind: str = "full", network: SequenceClassifier | None = None,
+                 seed: int | None = None):
         self.config, self.bank, self.model = config, bank, model
         self.kind, self.network = kind, network
-        self.previous = np.zeros(config["intent"]["latent_dim"], dtype=np.float32)
+        self.inference = inference_spec(config)
+        self.seed = self.inference["seed"] if seed is None else seed
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0:
+            raise ValueError("Estimator seed must be a nonnegative integer")
+        self.rng = np.random.default_rng(self.seed)
+        self.previous = (self.rng.standard_normal(config["intent"]["latent_dim"]).astype(np.float32)
+                         if self.inference["latent_mode"] == "sample" else
+                         np.zeros(config["intent"]["latent_dim"], dtype=np.float32))
         self.log_memory = np.zeros(GOALS)
         self.history = []
+        self.last_representation = None
+
+    def _result(self, posterior, native, kind, latent=None, latent_mean=None, latent_logvar=None):
+        self.last_representation = {
+            "shared": np.asarray(posterior, dtype=float).copy(),
+            "shared_kind": "categorical_goal_posterior_probability",
+            "native": np.asarray(native, dtype=float).copy(), "native_kind": kind,
+            "latent_available": latent is not None,
+            "latent_mean": None if latent_mean is None else np.asarray(latent_mean).copy(),
+            "latent_logvar": None if latent_logvar is None else np.asarray(latent_logvar).copy(),
+            "seed": self.seed, "latent_mode": self.inference["latent_mode"]}
+        return np.asarray(posterior), np.empty(0) if latent is None else np.asarray(latent).copy()
 
     def step(self, action: np.ndarray, observed: np.ndarray, current: np.ndarray,
              scene: Scene, age: float) -> tuple[np.ndarray, np.ndarray]:
         state = current if self.kind in {"br", "memory", "no_delay"} else observed
-        age = 0.0 if self.kind in {"br", "memory", "no_delay"} else age
         refs = self.bank.actions(state)
-        context = condition(state, scene, self.config["simulation"]["robot_radius"])
+        context = condition(state, scene, self.config["task"]["robot_radius"])
         a = unit(action).astype(np.float32)
-        logits = -self.config["intent"]["beta"] * angular_cost(a, refs)
+        costs = angular_cost(a, refs)
+        logits = -self.config["intent"]["beta"] * costs
         prior = np.zeros(GOALS)
         if self.kind == "memory":
             self.log_memory = self.config["intent"]["memory_decay"] * self.log_memory + logits
             self.log_memory -= self.log_memory.max()
-            return softmax(self.log_memory), self.previous.copy()
+            return self._result(softmax(self.log_memory), self.log_memory, "discounted_angular_goal_evidence")
         if self.kind in {"lstm", "transformer"}:
             self.history.append(np.r_[a, context])
             window = self.config["intent"]["sequence_window"]
             self.history = self.history[-window:]
             x = [self.history[0]] * (window - len(self.history)) + self.history
             with torch.no_grad():
-                prediction = self.network(torch.tensor(np.array(x)[None], dtype=torch.float32))
-            return softmax(prediction.numpy()[0]), self.previous.copy()
+                features = self.network.features(torch.tensor(np.array(x)[None], dtype=torch.float32))
+                prediction = self.network.head(features)
+            return self._result(softmax(prediction.numpy()[0]), features.numpy()[0],
+                                f"{self.kind}_last_token_features")
+        if self.kind == "no_latent":
+            if self.model is None or not self.model.context_prior_trained:
+                raise ValueError("The no_latent ablation requires a trained, audited context-only prior")
+            with torch.no_grad():
+                tensor = torch.from_numpy(context)[None]
+                features = self.model.context_classifier[:2](tensor)
+                prior = self.model.context_classifier[2](features).numpy()[0]
+            return self._result(softmax(prior + logits), features.numpy()[0],
+                                "context_only_classifier_hidden_features")
         if self.kind in {"full", "no_delay"}:
             if self.model is None:
                 raise ValueError("Latent inference requires a trained cVAE")
@@ -393,30 +525,56 @@ class IntentEstimator:
                 prior = self.model.classifier(torch.from_numpy(
                     np.r_[self.previous, context].astype(np.float32))[None]).numpy()[0]
                 deviation = np.linalg.norm(a - refs, axis=1).astype(np.float32)
-                mu, _ = self.model.encode(torch.from_numpy(a)[None],
-                                          torch.from_numpy(deviation)[None],
-                                          torch.from_numpy(context)[None])
-
-                self.previous = mu.numpy()[0]
-        return softmax(prior + logits), self.previous.copy()
+                mu, logvar = self.model.encode(torch.from_numpy(a)[None],
+                                               torch.from_numpy(deviation)[None],
+                                               torch.from_numpy(context)[None])
+                mean, log_variance = mu.numpy()[0], logvar.numpy()[0]
+                if self.inference["latent_mode"] == "sample":
+                    self.previous = (mean + np.exp(0.5 * log_variance) *
+                                     self.rng.standard_normal(len(mean))).astype(np.float32)
+                else:
+                    self.previous = mean.copy()
+            return self._result(softmax(prior + logits), mean, "encoder_posterior_mean",
+                                self.previous, mean, log_variance)
+        if self.kind not in {"br", "likelihood_only", "delay_br"}:
+            raise ValueError(f"Unknown intent estimator: {self.kind}")
+        return self._result(softmax(logits), costs, "candidate_angular_action_costs")
 
 
 def load_models(config: dict, directory: Path):
     c = config["intent"]
     audit_path = directory / "training-audit.json"
     metadata = {"schema_version": 0, "objective": {"name": "unrecorded"}}
+    if not audit_path.exists() and c.get("require_verified_training", True):
+        raise ValueError("Verified training-audit.json is required; unrecorded weights cannot be silently treated as trained artifacts")
     if audit_path.exists():
         metadata = json.loads(audit_path.read_text(encoding="utf-8"))
         for name in ("cvae", "lstm", "transformer"):
             actual = hashlib.sha256((directory / f"{name}.pt").read_bytes()).hexdigest()
             if actual != metadata["checkpoint_sha256"][name]:
                 raise ValueError(f"Checkpoint does not match training audit: {name}")
-        if metadata["architecture"] != model_spec(config):
-            raise ValueError("Network configuration does not match the training audit")
+        if metadata.get("schema_version", 0) >= 2:
+            if metadata["architecture"] != model_spec(config):
+                raise ValueError("Network configuration does not match the training audit")
+            if metadata["inference"]["latent_mode"] != inference_spec(config)["latent_mode"]:
+                raise ValueError("Inference latent mode differs from classifier training")
+        else:
+            expected = model_spec(config)
+            for key in ("encoder", "encoder_heads", "decoder", "decoder_heads", "goal_classifier",
+                        "lstm", "transformer", "sequence_window"):
+                if metadata["architecture"].get(key) != expected[key]:
+                    raise ValueError("Network configuration does not match the training audit")
+            if inference_spec(config)["latent_mode"] != "mean":
+                raise ValueError("Older classifier checkpoints require explicit mean inference; retrain for sampling")
         if metadata["objective"] != objective_spec(config):
             raise ValueError("Objective configuration does not match the training audit")
     cvae = ConditionalVAE(c["hidden_dim"], c["latent_dim"])
-    cvae.load_state_dict(torch.load(directory / "cvae.pt", weights_only=True, map_location="cpu"))
+    state = torch.load(directory / "cvae.pt", weights_only=True, map_location="cpu")
+    missing, unexpected = cvae.load_state_dict(state, strict=False)
+    if unexpected or any(not name.startswith("context_classifier.") for name in missing):
+        raise ValueError("Unexpected or missing cVAE checkpoint tensors")
+    cvae.context_prior_trained = (not missing and "context_only_classifier" in
+                                  metadata.get("trained_components", []))
     cvae.eval()
     cvae.training_metadata = metadata
     networks = {}

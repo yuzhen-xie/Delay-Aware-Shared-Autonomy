@@ -1,7 +1,7 @@
 skill:
-  refinement_count: 20
+  refinement_count: 30
 experiments:
   independent_repeats: 10
   autonomy_trials: 100
-  scenarios: [demonstrated, novel, wider, extra_obstacles]
-  refinement_budgets: [0, 5, 10, 20]
+  scenarios: [demonstrated, novel]
+  refinement_budgets: [0, 5, 10, 20, 30]

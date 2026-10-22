@@ -33,10 +33,16 @@ METRICS = {
     "early_prediction_seconds": "Early prediction time (s)",
     "completion_seconds": "Successful completion time (s)",
     "success_rate": "Task success fraction",
+    "stability_index": "Stability index",
+    "safety_index": "Safety index",
     "minimum_clearance_m": "Minimum TCP surface clearance (m)",
     "jerk_rms": "TCP jerk RMS (m/s³)",
     "reference_error_m": "Mean reference deviation (m)",
 }
+
+MEASURED_PROVENANCE = {"actual_participant_measurement", "UR10_measured_teleoperation",
+                       "UR10_measured_autonomous", "physical_robot_measurement",
+                       "measured_workstation_acquisition"}
 
 
 def load_rows(path: Path) -> list[dict]:
@@ -45,6 +51,8 @@ def load_rows(path: Path) -> list[dict]:
     result = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(result, list) or any(not isinstance(row, dict) for row in result):
         raise ValueError(f"Expected a JSON list of records: {path}")
+    if any(row.get("provenance") not in MEASURED_PROVENANCE for row in result):
+        raise ValueError("Figures accept only explicitly identified physical measurement records")
     return result
 
 
@@ -76,10 +84,15 @@ def unit_summary(rows: list[dict], metrics: list[str], group_keys: tuple[str, ..
 
     cells: dict[tuple, list[dict]] = {}
     for row in rows:
+        if row.get("provenance") not in MEASURED_PROVENANCE:
+            raise ValueError("Figure summaries require physical measurement provenance")
         if any(key not in row for key in group_keys):
             raise ValueError(f"Missing figure grouping field: {group_keys}")
         if "unit" not in row and "repeat" not in row:
             raise ValueError("Each figure record requires an independent unit or training repeat")
+        identity = row.get("unit", row.get("repeat"))
+        if identity is None or not str(identity).strip():
+            raise ValueError("Each physical record requires a nonempty independent-unit identifier")
         cells.setdefault(tuple(row[key] for key in group_keys), []).append(row)
     units, summaries = [], []
     for cell, selected in sorted(cells.items(), key=lambda item: repr(item[0])):
@@ -112,6 +125,8 @@ def unit_summary(rows: list[dict], metrics: list[str], group_keys: tuple[str, ..
                 ci = np.quantile(distribution, [0.025, 0.975]).tolist()
             summaries.append({**group, "metric": metric,
                               "mean": float(np.mean(estimates)) if estimates else None,
+                              "sd": float(np.std(estimates, ddof=1)) if len(estimates) >= 2 else None,
+                              "median": float(np.median(estimates)) if estimates else None,
                               "ci95": ci, "n_units": len(estimates),
                               "n_units_missing": len(all_units) - len(estimates),
                               "n_trials": len(selected),
@@ -123,13 +138,10 @@ def unit_summary(rows: list[dict], metrics: list[str], group_keys: tuple[str, ..
 
 
 def _provenance(rows: list[dict]) -> tuple[list[str], str]:
-    values = sorted({str(row.get("provenance", "unspecified")) for row in rows})
-    if values and all("synthetic" in value or "simulation" in value for value in values):
-        return values, "Synthetic task-space simulation"
-    if values and all(value != "unspecified" and "synthetic" not in value and "simulation" not in value
-                      for value in values):
-        return values, "Recorded data; provenance in manifest"
-    return values, "Mixed or unspecified provenance; inspect manifest"
+    values = sorted({row["provenance"] for row in rows})
+    if any(value not in MEASURED_PROVENANCE for value in values):
+        raise ValueError("Only physical measurement provenance is supported")
+    return values, "Physical human–robot measurements"
 
 
 def _draw_panel(ax, units, summaries, metric: str, x_key: str, x_values: list):
@@ -232,14 +244,20 @@ def build(config: dict, root: Path, output: Path | None = None) -> dict:
     inputs, result = [], {}
     specifications = [
         ("figure5", "intent", ["ipa", "early_prediction_seconds"], "delay_seconds",
-         "held-out operator"),
-        ("figure6", "sharing", ["completion_seconds", "success_rate", "minimum_clearance_m", "jerk_rms"],
-         "delay_seconds", "operator or simulated operator profile"),
+         "held-out participant"),
+        ("figure6", "sharing", ["completion_seconds", "success_rate", "stability_index", "safety_index"],
+         "delay_seconds", "registered participant"),
         ("learning", "refinement", ["success_rate", "reference_error_m"], "scenario",
          "independent skill-training repeat"),
     ]
     for name, stage, metrics, x_key, unit_kind in specifications:
         source = root / stage / "metrics.json"
+        if stage == "refinement" and not source.exists() and (root / "metrics.json").exists():
+            standalone = load_rows(root / "metrics.json")
+            if standalone and all(row.get("stage") == "autonomous_evaluation" for row in standalone):
+                source = root / "metrics.json"
+        if stage == "sharing" and (root / "trial_metrics.json").exists():
+            source = root / "trial_metrics.json"
         if not source.exists():
             result[name] = {"status": "missing_input", "required": str(source.relative_to(root))}
             continue
@@ -249,28 +267,61 @@ def build(config: dict, root: Path, output: Path | None = None) -> dict:
         selected = [row for row in rows if eligible(row)]
         excluded = [row for row in rows if not eligible(row)]
         if stage == "refinement":
-            selected = [{**row, "unit": str(row.get("repeat", row.get("unit")))} for row in selected]
+            selected = [{**row, "unit": str(row.get("unit") if row.get("unit") is not None else row["repeat"])}
+                        for row in selected]
         result[name] = _metric_set(config, selected, output, name, metrics, x_key, unit_kind)
+        result[name]["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+        result[name]["source_file"] = str(source.relative_to(root))
+        if stage == "sharing":
+            result["figure6_secondary"] = _metric_set(
+                config, selected, output, "figure6_secondary", ["minimum_clearance_m", "jerk_rms"],
+                x_key, unit_kind)
+            success_rates = root / "success_rates.csv"
+            if success_rates.exists():
+                inputs.append(success_rates)
+                (output / "figure6_success_denominators.csv").write_bytes(success_rates.read_bytes())
+                result[name]["success_denominators"] = "figure6_success_denominators.csv"
         result[name]["n_incomplete_budget_rows_excluded"] = len(excluded)
         if excluded:
             export_csv(output / f"{name}_incomplete_budget_diagnostics.csv", excluded)
         statistics = root / stage / "statistics.json"
+        if stage == "refinement" and source == root / "metrics.json":
+            statistics = root / "statistics.json"
+        if stage == "sharing" and source == root / "trial_metrics.json":
+            statistics = root / "statistics.json"
         if statistics.exists():
             inputs.append(statistics)
             content = json.loads(statistics.read_text(encoding="utf-8"))
+            if not isinstance(content, list):
+                raise ValueError("Figure statistics must contain a complete contrast table")
+            source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            if any(row.get("metric_source_sha256") is not None
+                   and row["metric_source_sha256"] != source_digest for row in content):
+                raise ValueError("Figure statistics do not identify the plotted measurement table")
             write_json(output / f"{name}_statistics.json", content)
             if isinstance(content, list):
                 export_csv(output / f"{name}_statistics.csv", content)
             result[name]["statistics"] = f"{name}_statistics.json"
+            result[name]["statistics_csv"] = f"{name}_statistics.csv"
+            result[name]["statistics_sha256"] = hashlib.sha256(statistics.read_bytes()).hexdigest()
+            result[name]["statistics_linkage"] = "verified_metric_source_sha256" if content and all(
+                row.get("metric_source_sha256") == source_digest for row in content) else "source_hash_not_recorded"
+            result[name]["p_value_columns"] = ["p_raw", "p_holm"]
+            result[name]["effect_columns"] = ["difference_mean", "effect_dz"]
+            result[name]["interval_columns"] = ["ci95", "effect_dz_ci95"]
         else:
             result[name]["statistics"] = None
     generalization = root / "generalization/metrics.json"
+    if not generalization.exists() and (root / "metrics.json").exists():
+        standalone = load_rows(root / "metrics.json")
+        if standalone and all(row.get("stage") == "autonomous_evaluation" for row in standalone):
+            generalization = root / "metrics.json"
     if generalization.exists():
         inputs.append(generalization)
         rows = load_rows(generalization)
         export_csv(output / "generalization_all_trials.csv", rows)
         selected = [row for row in rows if eligible(row)]
-        selected = [{**row, "unit": str(row.get("repeat", row.get("unit"))),
+        selected = [{**row, "unit": str(row.get("unit") if row.get("unit") is not None else row["repeat"]),
                      "budget": row.get("budget", row.get("refinement_budget"))} for row in selected]
         if any(row["budget"] is None for row in selected):
             raise ValueError("Generalization records require budget or refinement_budget")
@@ -283,23 +334,44 @@ def build(config: dict, root: Path, output: Path | None = None) -> dict:
                 config, subset, output, name, ["success_rate", "reference_error_m"], "budget",
                 "independent skill-training repeat")
         statistics = root / "generalization/statistics.json"
+        if generalization == root / "metrics.json":
+            statistics = root / "statistics.json"
         if statistics.exists():
             inputs.append(statistics)
             content = json.loads(statistics.read_text(encoding="utf-8"))
+            if not isinstance(content, list):
+                raise ValueError("Physical generalization statistics require a complete contrast table")
+            generalization_digest = hashlib.sha256(generalization.read_bytes()).hexdigest()
+            if any(row.get("metric_source_sha256") is not None
+                   and row["metric_source_sha256"] != generalization_digest for row in content):
+                raise ValueError("Generalization statistics differ from their recorded metric source")
             write_json(output / "generalization_statistics.json", content)
             if isinstance(content, list):
                 export_csv(output / "generalization_statistics.csv", content)
+            result["generalization_statistics"] = {
+                "json": "generalization_statistics.json", "csv": "generalization_statistics.csv",
+                "metric_source_sha256": generalization_digest,
+                "statistics_sha256": hashlib.sha256(statistics.read_bytes()).hexdigest()}
     else:
         result["generalization"] = {"status": "missing_input", "required": "generalization/metrics.json"}
 
-    result["figure8"] = {"status": "separate_measured_study_pipeline",
-                         "command": "dasa study-analyze TRIALS PARTICIPANTS PROTOCOL --tlx RATINGS --output STUDY"}
+    workload = root / "workload_figure_status.json"
+    if workload.exists():
+        result["figure8"] = json.loads(workload.read_text(encoding="utf-8"))
+        inputs.append(workload)
+        for name in ("questionnaire_contract.json", "tlx_original_statistics.json", "tlx_statistics.json",
+                     "tlx_original.csv", "tlx_original_burden.csv", "tlx_normalized.csv", "analysis_artifacts.json"):
+            if (root / name).exists():
+                inputs.append(root / name)
+    else:
+        result["figure8"] = {"status": "no_collected_workload_analysis",
+                             "required": "study_analyze_collected_original_questionnaire_ratings"}
     inputs.extend(path for path in (root / "manifest.json", root / "run_status.json") if path.exists())
     for directory in (root / "models", root / "scenes"):
         if directory.exists():
             inputs.extend(path for path in sorted(directory.rglob("*")) if path.is_file())
     record = manifest(config, "figures", list(dict.fromkeys(inputs)))
-    record["data_provenance"] = "derived_from_saved_input_records; see per-figure provenance"
+    record["data_provenance"] = "derived_physical_measurement_records"
     source_manifest = root / "manifest.json"
     if source_manifest.exists():
         source = json.loads(source_manifest.read_text(encoding="utf-8"))
