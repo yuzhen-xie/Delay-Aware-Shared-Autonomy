@@ -1,5 +1,3 @@
-"""Repeatable delayed-energy bench for coordinated force/velocity regulation."""
-
 from pathlib import Path
 
 import numpy as np

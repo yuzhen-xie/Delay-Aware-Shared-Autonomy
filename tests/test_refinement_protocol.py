@@ -110,7 +110,7 @@ def test_generalization_keeps_missing_budget_unavailable_and_units_as_repeats(co
         "reference_error_m": .01})
     output = tmp_path / "analysis"
     rows = module.generalization(config, prepared, candidates, output)
-    assert len(rows) == 8  # baseline + three complete one-demonstration fits per repeat
+    assert len(rows) == 8
     assert all(row["refinement_budget"] in (0, 1) for row in rows)
     assert sum(row["condition"] == "bootstrap" for row in rows) == 2
     budget_rows = json.loads((output / "budgets.json").read_text())
@@ -206,3 +206,82 @@ def test_collection_loader_distinguishes_trial_and_demonstration_schema_one(conf
     assert [d.metadata["episode_id"] for d in loaded] == ["processed", "raw_trial"]
     assert loaded[1].metadata["simulation_seed"] == 42
     assert loaded[1].metadata["recording_format"] == "simulation_trial"
+    for changed in ({"schema_version": 2}, {"provenance": "measured_device_session"}):
+        altered = copy.deepcopy(trial)
+        altered.metadata.update(changed)
+        altered.save(tmp_path / "001.npz")
+        with pytest.raises(ValueError, match="Unsupported recording schema"):
+            load_candidates(tmp_path)
+
+
+def test_success_admission_rejects_missing_or_untyped_task_annotations(config):
+    from dasa.data import bootstrap_admission, successful
+
+    config = small_config(config)
+    demo = demonstration(config, 1, "annotated")
+    assert bootstrap_admission([demo], config)[0]["accepted"]
+    for field, value, expected in (
+            ("collision", None, "missing_annotation:collision"),
+            ("bounds_violation", "false", "invalid_annotation:bounds_violation"),
+            ("placed", "true", "invalid_annotation:placed"),
+            ("grasped_goal", False, "invalid_annotation:grasped_goal")):
+        invalid = copy.deepcopy(demo)
+        if value is None:
+            invalid.metadata.pop(field)
+        else:
+            invalid.metadata[field] = value
+        accepted, reasons = successful(invalid, config)
+        assert not accepted and expected in reasons
+        with pytest.raises(ValueError, match="failed admission"):
+            bootstrap_admission([invalid], config)
+
+
+def test_train_dataset_rejects_failed_bootstrap_before_model_training(config, tmp_path):
+    from dasa.data import Demonstration
+    from dasa.experiments import train_dataset
+
+    config = small_config(config)
+    config["experiments"].update(bootstrap_demonstrations=3, validation_demonstrations=1,
+                                 test_demonstrations=1)
+    source = tmp_path / "recordings"
+    splits = generate_dataset(config, source)
+    path = source / splits["train"][0]
+    failed = Demonstration.load(path)
+    failed.metadata["success"] = False
+    failed.save(path)
+    output = tmp_path / "trained"
+    with pytest.raises(ValueError, match="Bootstrap demonstrations failed admission"):
+        train_dataset(config, source, output)
+    assert not (output / "models/bootstrap_hsmm.npz").exists()
+    assert not (output / "models/cvae.pt").exists()
+
+
+def test_refine_data_honors_acquisition_order_and_raw_trial_schema(config, tmp_path):
+    from dasa.experiments import refine_dataset
+    from dasa.simulation import Trial
+
+    config = small_config(config)
+    config["experiments"].update(bootstrap_demonstrations=3, validation_demonstrations=1,
+                                 test_demonstrations=1)
+    config["skill"]["refinement_count"] = 1
+    data = tmp_path / "dataset"
+    generate_dataset(config, data)
+    collection = tmp_path / "collection"
+    demonstration(config, 100, "processed_first").save(collection / "000.npz")
+    demo = demonstration(config, 101, "recorded_first")
+    Trial({key: getattr(demo, key) for key in (
+        "time", "position", "velocity", "raw_force", "observed_state", "phase")}, {
+            "schema_version": 1, "trial_id": "recorded_first", "operator_id": "collection",
+            "scene": demo.scene.to_dict(), "intended_goal": 0, "success": True,
+            "collision": False, "bounds_violation": False, "grasped_goal": 0,
+            "condition": "C1", "delay_seconds": .8, "seed": 101,
+            "provenance": "synthetic_task_space_simulation"}).save(collection / "001.npz")
+    (collection / "order.json").write_text(json.dumps(["001.npz", "000.npz"]))
+    output = tmp_path / "refined"
+    refine_dataset(config, data, collection, output)
+    model = TPHSMM.load(config, output / "refined_hsmm.npz")
+    assert model.fit_manifest["refinement"]["accepted_ids"] == ["recorded_first"]
+    metadata = json.loads((output / "refinement_metadata.json").read_text())
+    assert metadata["candidate_order"] == "order.json" and metadata["quota_met"]
+    inputs = json.loads((output / "manifest.json").read_text())["input_sha256"]
+    assert str(collection / "order.json") in inputs

@@ -1,9 +1,8 @@
-"""Calibrated RGB-D color segmentation with explicit geometric center estimates."""
-
 from __future__ import annotations
 
 import json
 import copy
+import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -13,7 +12,7 @@ from scipy.optimize import least_squares
 
 from dasa.config import write_json
 from dasa.geometry import Scene
-from dasa.robotics.calibration import transform_points
+from dasa.robotics.calibration import load_calibration, transform_points
 
 
 @dataclass(frozen=True)
@@ -74,7 +73,7 @@ def validate_transform(transform: np.ndarray) -> np.ndarray:
 
 def deproject(pixels_uv: np.ndarray, depths_m: np.ndarray,
               intrinsics: CameraIntrinsics) -> np.ndarray:
-    """Undistorted pixels and optical-axis depths map to camera-frame XYZ in metres."""
+
     intrinsics.validate()
     pixels, depths = np.asarray(pixels_uv, float), np.asarray(depths_m, float)
     if (pixels.ndim != 2 or pixels.shape[1] != 2 or depths.shape != (len(pixels),)
@@ -109,11 +108,11 @@ def detect_scene(rgb: np.ndarray, depth: np.ndarray, intrinsics: CameraIntrinsic
                  depth_scale_m: float = 0.001, minimum_pixels: int = 30,
                  minimum_depth_m: float = 0.1, maximum_depth_m: float = 3.0,
                  maximum_sphere_residual_m: float = 0.005) -> dict:
-    """Detect every declared object, failing closed on missing or ambiguous geometry.
 
-    RGB and depth must already be time-aligned, registered and undistorted. This
-    function estimates geometry; it does not connect to or command a robot.
-    """
+
+
+
+
     intrinsics.validate()
     transform = validate_transform(camera_to_base)
     rgb, depth = np.asarray(rgb), np.asarray(depth)
@@ -194,7 +193,7 @@ def detect_scene(rgb: np.ndarray, depth: np.ndarray, intrinsics: CameraIntrinsic
 def snapshot_to_scene(snapshot: dict, goal_ids: list[str], place: list[float],
                       start: list[float], *, maximum_age_s: float | None = None,
                       current_time_s: float | None = None) -> Scene:
-    """Build one consistent scene snapshot; never mix centers from different frames."""
+
     if (snapshot.get("schema_version") != 1 or snapshot.get("target_frame") != "base"
             or snapshot.get("provenance") != "calibrated_rgbd_geometry"):
         raise ValueError("A calibrated base-frame perception snapshot is required")
@@ -230,7 +229,7 @@ def snapshot_to_scene(snapshot: dict, goal_ids: list[str], place: list[float],
 
 
 class PerceptionStream:
-    """Whole-frame updates with monotonic source identifiers and an age deadline."""
+
 
     def __init__(self, goal_ids: list[str], place: list[float], start: list[float], *,
                  maximum_age_s: float = 0.2):
@@ -265,8 +264,25 @@ class PerceptionStream:
 
 def perceive_file(rgbd_path: str | Path, specification_path: str | Path,
                   output: str | Path) -> dict:
-    """Process recorded RGB-D arrays with an explicit calibration/segmentation contract."""
+
     specification = json.loads(Path(specification_path).read_text(encoding="utf-8"))
+    calibration_record = specification.pop("calibration_record", None)
+    calibration_digest = None
+    if calibration_record is not None:
+        calibration_path = Path(calibration_record)
+        if not calibration_path.is_absolute():
+            calibration_path = Path(specification_path).resolve().parent / calibration_path
+        calibration = load_calibration(calibration_path)
+        for name, value in (("calibration_id", calibration["calibration_id"]),
+                            ("camera_frame", calibration["source_frame"])):
+            if name in specification and specification[name] != value:
+                raise ValueError("Perception specification conflicts with its calibration record")
+            specification[name] = value
+        if "camera_to_base" in specification and not np.allclose(
+                specification["camera_to_base"], calibration["transform"], atol=1e-8, rtol=0):
+            raise ValueError("Perception transform conflicts with its calibration record")
+        specification["camera_to_base"] = calibration["transform"]
+        calibration_digest = hashlib.sha256(calibration_path.read_bytes()).hexdigest()
     intrinsics = CameraIntrinsics(**specification.pop("intrinsics"))
     objects = [ColorObject(**item) for item in specification.pop("objects")]
     transform = np.asarray(specification.pop("camera_to_base"), float)
@@ -276,5 +292,7 @@ def perceive_file(rgbd_path: str | Path, specification_path: str | Path,
                                 transform, objects, **specification)
     if scene_specification is not None:
         snapshot["scene"] = snapshot_to_scene(snapshot, **scene_specification).to_dict()
+    if calibration_digest is not None:
+        snapshot["calibration_record_sha256"] = calibration_digest
     write_json(output, snapshot)
     return snapshot

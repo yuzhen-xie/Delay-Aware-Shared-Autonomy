@@ -1,5 +1,3 @@
-"""Paired independent-unit inference with declared multiplicity and uncertainty."""
-
 import hashlib
 import itertools
 
@@ -7,7 +5,7 @@ import numpy as np
 
 
 def holm(p_values: list[float | None], family_size: int | None = None) -> list[float | None]:
-    """Holm adjusted p values; unavailable hypotheses may remain in the planned family."""
+
     valid = [i for i, p in enumerate(p_values) if p is not None]
     if any(not np.isfinite(p_values[i]) or not 0 <= p_values[i] <= 1 for i in valid):
         raise ValueError("p values must be finite probabilities")
@@ -86,7 +84,7 @@ def aggregate(rows: list[dict], method: str, delay: float, metric: str) -> dict:
 
 def comparisons(rows: list[dict], reference: str, methods: list[str], metrics: list[str], config: dict,
                 family="all_planned_comparisons_in_this_analysis_file", planned_delays=None):
-    """One unit mean per cell; Holm includes every declared metric/method/delay contrast."""
+
     results = []
     delays = sorted(set(planned_delays) if planned_delays is not None
                     else {r["delay_seconds"] for r in rows})

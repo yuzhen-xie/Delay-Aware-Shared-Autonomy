@@ -1,5 +1,3 @@
-"""Prospective study schedules and audited analysis of collected participant records."""
-
 import csv
 import hashlib
 import json
@@ -28,7 +26,7 @@ def _write_csv(path, rows):
 
 
 def write_schedule(config: dict, output: Path):
-    """Generate a prospective Williams schedule; never infer a historical condition order."""
+
     study = config.get("study", {})
     conditions = list(study.get("conditions", ["C1", "C2", "C3", "C4"]))
     delays = list(study.get("feedback_delays_seconds", config["experiments"]["sharing_delays"]))
@@ -154,7 +152,7 @@ PUBLIC_PROTOCOL_FIELDS = {
 
 
 def analyze(config, trials_path, participants_path, protocol_path, tlx_path, output):
-    """Import actual observations; planned schedules and templates never create measurements."""
+
     participants = read_csv(participants_path)
     with Path(protocol_path).open(encoding="utf-8") as stream:
         protocol = yaml.safe_load(stream)

@@ -1,5 +1,3 @@
-"""Configuration loading, validation and experiment provenance."""
-
 from __future__ import annotations
 
 import copy

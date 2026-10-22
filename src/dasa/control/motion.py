@@ -1,12 +1,10 @@
-"""Cartesian force guidance and a fully specified random-walk Kalman filter."""
-
 import numpy as np
 
 from dasa.geometry import Scene, clamp_norm
 
 
 class ForceKalman:
-    """x_(k+1)=x_k+w, y_k=x_k+v; Q=qI and R=rI in N² per sample."""
+
     def __init__(self, process: float, measurement: float, initial_variance: float = 1.0):
         if process < 0 or measurement <= 0 or initial_variance <= 0:
             raise ValueError("Kalman Q must be nonnegative; R and initial variance must be positive")
@@ -27,8 +25,8 @@ class ForceKalman:
 def potential_force(position: np.ndarray, target: np.ndarray, scene: Scene, config: dict):
     c = config["motion"]
     force = c.get("attractive_weight", 1.0) * c["attractive_gain"] * (target - position)
-    # Gaussian radial repulsion: k_rep (p-o)/sigma² exp(-||p-o||²/(2 sigma²)).
-    # Center distance defines the field; risk uses the configured distance convention.
+
+
     delta = position - scene.centers
     sigma = c["repulsive_sigma"]
     repulsion = c["repulsive_gain"] * delta / sigma**2

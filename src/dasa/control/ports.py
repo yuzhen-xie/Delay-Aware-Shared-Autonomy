@@ -1,10 +1,3 @@
-"""Coordinated sampled-energy regulation of force and velocity ports.
-
-Power is positive toward the connected system at every output port. Inbound
-energy is supplied separately by the network observer. Force ports modify effort;
-velocity ports modify flow. Sampled input values are held during one interval.
-"""
-
 from dataclasses import dataclass
 
 import numpy as np

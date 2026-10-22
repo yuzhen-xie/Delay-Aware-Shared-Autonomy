@@ -1,5 +1,3 @@
-"""Frame-consistent geometry for point-mass manipulation benchmarks."""
-
 from dataclasses import dataclass
 
 import numpy as np
@@ -84,6 +82,6 @@ def waypoints(scene: Scene, goal: int, lift: float) -> np.ndarray:
 
 
 def task_frames(scene: Scene, goal: int) -> tuple[np.ndarray, np.ndarray]:
-    """Start, object and placement frames; axes remain aligned with the calibrated base."""
+
     return np.repeat(np.eye(3)[None], 3, axis=0), np.array(
         [scene.start, scene.goals[goal], scene.place])

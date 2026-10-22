@@ -1,5 +1,3 @@
-"""Operational metric definitions; unavailable outcomes remain missing."""
-
 import numpy as np
 
 from dasa.simulation import Trial

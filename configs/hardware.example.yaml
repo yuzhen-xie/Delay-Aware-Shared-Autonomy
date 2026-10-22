@@ -1,31 +1,26 @@
+schema_version: 2
 robot:
-  host: TO_FILL
   model: UR10
 master:
   udp_port: 55001
 gripper:
-  type: external
+  type: robotiq_socket
   port: 63352
+  speed: 64
+  force: 64
+  timeout_seconds: 1.0
 loop_seconds: 0.02
 maximum_seconds: 60.0
 feedback_delay_seconds: 0.8
-calibration_record: TO_FILL
 limits:
   maximum_speed_m_s: 0.08
   maximum_master_force_N: 12.0
   maximum_reflection_force_N: 2.0
   watchdog_seconds: 0.10
+  feedback_acknowledgement_seconds: 0.10
   calibration_rms_m: 0.005
   minimum_jacobian_singular_value: 0.02
   obstacle_margin_m: 0.04
+  start_tolerance_m: 0.05
   workspace_min_m: [0.02, -0.55, 0.02]
   workspace_max_m: [0.95, 0.55, 0.85]
-scene:
-  provenance: TO_FILL
-  frame: base
-  goals: [[0.56, -0.25, 0.12], [0.64, 0.0, 0.12], [0.55, 0.24, 0.12]]
-  place: [0.80, 0.29, 0.12]
-  start: [0.16, -0.10, 0.46]
-  centers: [[0.43, 0.0, 0.23], [0.35, -0.28, 0.19]]
-  radii: [0.075, 0.060]
-  obstacle_ids: [center, left]

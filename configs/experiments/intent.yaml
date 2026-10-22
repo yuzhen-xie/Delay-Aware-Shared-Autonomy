@@ -1,4 +1,3 @@
-# Full declared simulation budget; does not supply measured demonstration data.
 intent:
   objective: joint_elbo
   kl_weight: 1.0

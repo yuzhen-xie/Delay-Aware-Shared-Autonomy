@@ -40,7 +40,7 @@ def _marker_image():
 def test_snapshot_marker_geometry_and_age():
     camera, rgb, depth, objects, transform = _marker_image()
     depth[5:7, 5:7] = 0
-    depth[7, 7] = 2900  # A valid-range background leak is removed by the depth MAD rule.
+    depth[7, 7] = 2900
     snapshot = detect_scene(rgb, depth, camera, transform, objects, timestamp_s=1.2,
                             sequence=4, calibration_id="check-2026-10-20")
     first = snapshot["detections"][0]

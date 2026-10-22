@@ -1,5 +1,3 @@
-"""Unit-level figure exports with explicit inputs, missingness and analysis scope."""
-
 from __future__ import annotations
 
 import csv
@@ -51,7 +49,7 @@ def load_rows(path: Path) -> list[dict]:
 
 
 def export_csv(path: Path, rows: list[dict]) -> None:
-    """Use a union of columns; preserve structured fields as JSON cells."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", newline="", encoding="utf-8") as stream:
@@ -63,19 +61,19 @@ def export_csv(path: Path, rows: list[dict]) -> None:
 
 
 def eligible(row: dict) -> bool:
-    """Incomplete demonstration budgets cannot enter fixed-budget comparisons."""
+
     return all(row.get(key) is not False for key in
                ("refinement_quota_met", "confirmatory_eligible", "quota_met"))
 
 
 def unit_summary(rows: list[dict], metrics: list[str], group_keys: tuple[str, ...],
                  seed: int, bootstrap: int = 5000) -> tuple[list[dict], list[dict]]:
-    """First average repeated trials within each unit, then weight units equally.
 
-    Intervals describe each condition mean and resample independent units. They
-    are distinct from the paired-difference intervals in the statistics export.
-    A single unit has no inferential interval; no zero-width CI is substituted.
-    """
+
+
+
+
+
     cells: dict[tuple, list[dict]] = {}
     for row in rows:
         if any(key not in row for key in group_keys):
@@ -192,7 +190,7 @@ def _save_figure(fig, path: Path) -> list[str]:
 
 
 def _metric_set(config: dict, rows: list[dict], output: Path, name: str,
-                metrics: list[str], x_key: str, unit_kind: str, caption: str) -> dict:
+                metrics: list[str], x_key: str, unit_kind: str) -> dict:
     group_keys = ("condition", x_key)
     unit_rows, summaries = unit_summary(rows, metrics, group_keys, config["seed"],
                                         config["experiments"]["bootstrap_samples"])
@@ -203,7 +201,7 @@ def _metric_set(config: dict, rows: list[dict], output: Path, name: str,
                                                    for row in summaries)]
     provenance, subtitle = _provenance(rows)
     details = {"status": "available" if available else "no_observed_metrics", "unit_kind": unit_kind,
-               "provenance": provenance, "caption": caption, "metrics": available,
+               "provenance": provenance, "metrics": available,
                "n_input_rows": len(rows), "files": [f"{name}_units.csv", f"{name}_summary.csv",
                                                     f"{name}_summary.json"]}
     if not available:
@@ -223,37 +221,24 @@ def _metric_set(config: dict, rows: list[dict], output: Path, name: str,
                  fontsize=11, y=.995)
     fig.tight_layout(rect=(0, .09 if len(labels) > 4 else .065, 1, .985), h_pad=2.1, w_pad=2.3)
     details["files"].extend(_save_figure(fig, output / name))
-    (output / f"{name}_caption.txt").write_text(caption + "\n", encoding="utf-8")
-    details["files"].append(f"{name}_caption.txt")
     return details
 
 
 def build(config: dict, root: Path, output: Path | None = None) -> dict:
-    """Export figures from saved metrics without running or modifying experiments."""
+
     root = Path(root)
     output = Path(output) if output is not None else root / "figures"
     output.mkdir(parents=True, exist_ok=True)
     inputs, result = [], {}
     specifications = [
         ("figure5", "intent", ["ipa", "early_prediction_seconds"], "delay_seconds",
-         "held-out operator", "IPA is the fraction of pickup-stage decisions with the correct goal and "
-         "posterior above the configured threshold. EPT requires a sustained correct prediction and "
-         "successful task completion; missing EPT is not zero. Episodes are averaged within held-out "
-         "operators. Point intervals describe condition means; paired-difference inference is exported "
-         "separately. No significance markers are inferred from interval overlap."),
+         "held-out operator"),
         ("figure6", "sharing", ["completion_seconds", "success_rate", "minimum_clearance_m", "jerk_rms"],
-         "delay_seconds", "operator or simulated operator profile", "Successful completion time conditions "
-         "on success; success fraction retains failures. Clearance is the minimum TCP-sphere to obstacle-" 
-         "sphere surface separation. Jerk is a Cartesian translational quantity. These explicit metrics "
-         "do not instantiate an unspecified steering-based safety or stability index. Repeated trials "
-         "are first averaged within operators. Collision avoidance does not follow from passivity."),
+         "delay_seconds", "operator or simulated operator profile"),
         ("learning", "refinement", ["success_rate", "reference_error_m"], "scenario",
-         "independent skill-training repeat", "Only completed demonstration budgets enter comparative "
-         "learning summaries. Each independent training repeat contributes one scenario mean, regardless "
-         "of its evaluation trial count. Reference deviation measures reproduction consistency and is "
-         "not an independent measure of task success, collision avoidance or optimality."),
+         "independent skill-training repeat"),
     ]
-    for name, stage, metrics, x_key, unit_kind, caption in specifications:
+    for name, stage, metrics, x_key, unit_kind in specifications:
         source = root / stage / "metrics.json"
         if not source.exists():
             result[name] = {"status": "missing_input", "required": str(source.relative_to(root))}
@@ -265,7 +250,7 @@ def build(config: dict, root: Path, output: Path | None = None) -> dict:
         excluded = [row for row in rows if not eligible(row)]
         if stage == "refinement":
             selected = [{**row, "unit": str(row.get("repeat", row.get("unit")))} for row in selected]
-        result[name] = _metric_set(config, selected, output, name, metrics, x_key, unit_kind, caption)
+        result[name] = _metric_set(config, selected, output, name, metrics, x_key, unit_kind)
         result[name]["n_incomplete_budget_rows_excluded"] = len(excluded)
         if excluded:
             export_csv(output / f"{name}_incomplete_budget_diagnostics.csv", excluded)
@@ -296,10 +281,7 @@ def build(config: dict, root: Path, output: Path | None = None) -> dict:
             name = f"generalization_{safe_name}"
             result["generalization"][scenario] = _metric_set(
                 config, subset, output, name, ["success_rate", "reference_error_m"], "budget",
-                "independent skill-training repeat", "Matched held-out scene evaluation with frozen "
-                "bootstrap data and accepted demonstration prefixes. Zero additional demonstrations is "
-                "the unrefined baseline. Intervals resample independent training repeats. Unmet budgets "
-                "are excluded; plotted budgets are not independent groups and require paired inference.")
+                "independent skill-training repeat")
         statistics = root / "generalization/statistics.json"
         if statistics.exists():
             inputs.append(statistics)
@@ -309,10 +291,9 @@ def build(config: dict, root: Path, output: Path | None = None) -> dict:
                 export_csv(output / "generalization_statistics.csv", content)
     else:
         result["generalization"] = {"status": "missing_input", "required": "generalization/metrics.json"}
-    # Questionnaire graphics are generated by study-analyze from observed ratings.
+
     result["figure8"] = {"status": "separate_measured_study_pipeline",
-                         "command": "dasa study-analyze TRIALS PARTICIPANTS PROTOCOL --tlx RATINGS --output STUDY",
-                         "reason": "Questionnaire responses are not generated by the simulator."}
+                         "command": "dasa study-analyze TRIALS PARTICIPANTS PROTOCOL --tlx RATINGS --output STUDY"}
     inputs.extend(path for path in (root / "manifest.json", root / "run_status.json") if path.exists())
     for directory in (root / "models", root / "scenes"):
         if directory.exists():

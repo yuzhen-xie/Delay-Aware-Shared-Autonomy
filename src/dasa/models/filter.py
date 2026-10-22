@@ -1,5 +1,3 @@
-"""Causal explicit-duration state filtering for task-parameterized skills."""
-
 import numpy as np
 from scipy.special import logsumexp
 
@@ -24,7 +22,7 @@ class HSMMFilter:
             predicted = np.zeros_like(self.belief)
             predicted[:, 1:] = self.belief[:, :-1] * (1 - self.hazard[:, :-1])
             predicted[1:, 0] = np.sum(self.belief[:-1] * self.hazard[:-1], axis=1)
-            # A completed skill remains in the terminal state while the executor holds position.
+
             predicted[-1, -1] += np.sum(self.belief[-1] * self.hazard[-1])
             self.belief = predicted
         self.first = False

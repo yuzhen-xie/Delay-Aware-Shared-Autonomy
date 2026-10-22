@@ -1,4 +1,3 @@
-# Compatibility profile for explicitly identified earlier training runs.
 intent:
   objective: legacy_weighted_auxiliary
   kl_weight: 0.05

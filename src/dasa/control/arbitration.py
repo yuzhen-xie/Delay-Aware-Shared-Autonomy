@@ -1,5 +1,3 @@
-"""Explicit control configurations and command-quality proxies."""
-
 from collections import deque
 from dataclasses import dataclass
 
@@ -61,7 +59,7 @@ def authority(condition: ControlCondition, autonomous: float, human: float, conf
     alpha = autonomous / (autonomous + human + c["epsilon"])
     scale = 1.0
     if condition.guarded:
-        # Relative confidence does not represent absolute command reliability.
+
         scale = min(1.0, (autonomous + human) / c["low_confidence_threshold"])
         if corrective and clearance < c["correction_distance"]:
             alpha = min(alpha, c.get("guarded_corrective_max", 0.15))

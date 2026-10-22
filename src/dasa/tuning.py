@@ -1,5 +1,3 @@
-"""Validation-only, one-at-a-time sensitivity of frozen shared-control models."""
-
 from __future__ import annotations
 
 import copy
@@ -65,7 +63,7 @@ def _candidate_configs(config: dict, parameters: list[str] | None) -> list[tuple
 
 
 def _validation_data(root: Path) -> tuple[list[Demonstration], list[Path], dict]:
-    """Check split paths without opening train/test demonstrations."""
+
     splits_path = root / "splits.json"
     splits = json.loads(splits_path.read_text(encoding="utf-8"))
     paths, owner = {}, {}
@@ -98,7 +96,7 @@ def _validation_data(root: Path) -> tuple[list[Demonstration], list[Path], dict]
 
 
 def _summary(rows: list[dict]) -> dict:
-    """Average within source-operator groups before averaging their outcomes."""
+
     units = sorted({row["unit"] for row in rows})
     summaries = []
     for unit in units:
@@ -121,11 +119,11 @@ def _summary(rows: list[dict]) -> dict:
 
 def sweep(config: dict, prepared_root: Path, output: Path,
           parameters: list[str] | None = None) -> list[dict]:
-    """Evaluate OAT grids on validation scenes without training or test access.
 
-    Selection is prospective and per parameter. Winners are not combined into a
-    new configuration: interactions have not been assessed by this experiment.
-    """
+
+
+
+
     prepared_root, output = Path(prepared_root), Path(output)
     validate(config)
     candidates = _candidate_configs(config, parameters)

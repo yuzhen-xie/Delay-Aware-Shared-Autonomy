@@ -44,7 +44,7 @@ def spy_estimators(monkeypatch):
 
         def step(self, action, observed, current, scene, age):
             calls[self.method].append((action.copy(), observed.copy(), current.copy(), age))
-            # A causal, label-free stand-in; it deliberately consumes only this sample.
+
             probability = np.array([action[0] + observed[0], 1., 1.])
             probability /= probability.sum()
             self.previous += [action[0], observed[0]]

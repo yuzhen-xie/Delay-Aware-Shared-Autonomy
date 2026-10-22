@@ -1,5 +1,3 @@
-"""Causal intent inference with a learned behavioral prior and angular likelihood."""
-
 from __future__ import annotations
 
 import hashlib
@@ -34,7 +32,7 @@ def angular_cost(action: np.ndarray, references: np.ndarray) -> np.ndarray:
         return np.zeros(len(references))
     cosine = unit(references) @ unit(action)
     angles = np.arccos(np.clip(cosine, -1, 1))
-    # A vanishing reference direction carries no directional evidence.
+
     angles[np.linalg.norm(references, axis=1) < 1e-9] = np.pi / 2
     return angles
 
@@ -87,14 +85,14 @@ class ConditionalVAE(nn.Module):
 
 
 def negative_elbo(action, predicted, mu, logvar):
-    """Unit-variance Gaussian NLL (constant omitted) plus KL to N(0,I)."""
+
     nll = 0.5 * (action - predicted).square().sum(-1).mean()
     kl = 0.5 * (mu.square() + logvar.exp() - 1 - logvar).sum(-1).mean()
     return nll, kl
 
 
 def objective_spec(config: dict) -> dict:
-    """Resolve the objective without inferring historical objectives from weights."""
+
     c = config["intent"]
     name = c.get("objective", "joint_elbo")
     if name == "joint_elbo":
@@ -119,7 +117,7 @@ def objective_spec(config: dict) -> dict:
 
 
 def cvae_loss(action, predicted, deviation, predicted_deviation, mu, logvar, config: dict):
-    """Return the optimized tensor and separate, directly auditable components."""
+
     action_nll, kl = negative_elbo(action, predicted, mu, logvar)
     deviation_nll = 0.5 * (predicted_deviation - deviation).square().sum(-1).mean()
     spec = objective_spec(config)
@@ -131,7 +129,7 @@ def cvae_loss(action, predicted, deviation, predicted_deviation, mu, logvar, con
 
 
 def model_spec(config: dict) -> dict:
-    """Describe the concrete network and preprocessing saved with each training run."""
+
     c = config["intent"]
     hidden, latent = c["hidden_dim"], c["latent_dim"]
     return {"action_dimension": ACTION_DIM, "deviation_dimension": GOALS,
@@ -158,7 +156,7 @@ def model_spec(config: dict) -> dict:
 
 
 def _arrays_digest(arrays: dict) -> dict:
-    """Hash the ordered values, dimensions and dtypes used for optimization."""
+
     result = {}
     for key in ("action", "deviation", "context", "label", "episode"):
         value = np.ascontiguousarray(arrays[key])
@@ -398,7 +396,7 @@ class IntentEstimator:
                 mu, _ = self.model.encode(torch.from_numpy(a)[None],
                                           torch.from_numpy(deviation)[None],
                                           torch.from_numpy(context)[None])
-                # The prior uses z_(t-1); the current action only updates the next prior.
+
                 self.previous = mu.numpy()[0]
         return softmax(prior + logits), self.previous.copy()
 

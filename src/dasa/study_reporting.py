@@ -1,5 +1,3 @@
-"""Workload figures generated exclusively from imported participant ratings."""
-
 import os
 from pathlib import Path
 

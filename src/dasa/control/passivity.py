@@ -1,11 +1,3 @@
-"""Three-port energy accounting with a discrete-work output constraint.
-
-The tank enforces a sampled controller-boundary inequality, not a proof of the
-entire delayed bilateral robot/human system. Port allocations are diagnostic
-shares of the removed robot work; physical PC1/PC3 deployment requires measured
-master velocities and a device-specific autonomous controller realization.
-"""
-
 from collections import deque
 from dataclasses import dataclass
 
@@ -51,7 +43,7 @@ class ThreePortTank:
         nominal_work = self.robot_work(nominal, velocity)
         force = nominal.copy()
         if nominal_work > available:
-            # W(F) is a convex quadratic. Its sublevel set is a Euclidean ball.
+
             center = -mass * velocity / dt
             radius2 = available * (2 * mass + dt * damping) / dt**2
             radius2 += mass**2 * (velocity @ velocity) / dt**2

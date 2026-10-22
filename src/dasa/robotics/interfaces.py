@@ -1,10 +1,10 @@
-"""Measured-state RTDE access and bounded, explicitly enabled motion commands."""
-
 from __future__ import annotations
 
 import json
 import socket
 import time
+import re
+import select
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,68 +28,112 @@ class RobotState:
 
 class URRTDE:
     def __init__(self, host: str, execute: bool = False, maximum_speed: float = 0.08):
+        if not isinstance(host, str) or not host.strip() or not np.isfinite(maximum_speed) or maximum_speed <= 0:
+            raise ValueError("Robot host and a positive finite maximum speed are required")
         try:
             import rtde_receive
         except ImportError as exc:
             raise RuntimeError("Install the workstation dependency ur-rtde before connecting") from exc
-        self.receive = rtde_receive.RTDEReceiveInterface(host)
-        self.control = None
+        self.receive, self.control, self.closed = None, None, False
         self.execute, self.maximum_speed = execute, maximum_speed
-        if execute:
-            import rtde_control
-            self.control = rtde_control.RTDEControlInterface(host)
         self.commands = []
+        try:
+            self.receive = rtde_receive.RTDEReceiveInterface(host)
+            if hasattr(self.receive, "isConnected") and not self.receive.isConnected():
+                raise ConnectionError("The RTDE receive connection was not established")
+            if execute:
+                import rtde_control
+                self.control = rtde_control.RTDEControlInterface(host)
+                if hasattr(self.control, "isConnected") and not self.control.isConnected():
+                    raise ConnectionError("The RTDE control connection was not established")
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def state(self) -> RobotState:
-        pose = np.asarray(self.receive.getActualTCPPose())
-        return RobotState(float(self.receive.getTimestamp()), pose[:3], pose[3:],
-                          np.asarray(self.receive.getActualTCPSpeed())[:3],
-                          np.asarray(self.receive.getActualTCPForce()),
-                          np.asarray(self.receive.getActualQ()), int(self.receive.getSafetyMode()))
+        if self.closed:
+            raise RuntimeError("The RTDE connection is closed")
+        pose = np.asarray(self.receive.getActualTCPPose(), float)
+        velocity = np.asarray(self.receive.getActualTCPSpeed(), float)
+        wrench = np.asarray(self.receive.getActualTCPForce(), float)
+        joints = np.asarray(self.receive.getActualQ(), float)
+        stamp = float(self.receive.getTimestamp())
+        if (any(value.shape != (6,) or not np.isfinite(value).all()
+                for value in (pose, velocity, wrench, joints)) or not np.isfinite(stamp) or stamp < 0):
+            raise ValueError("RTDE returned invalid measured robot state")
+        return RobotState(stamp, pose[:3], pose[3:], velocity[:3], wrench, joints,
+                          int(self.receive.getSafetyMode()))
 
     def speed(self, velocity, duration: float, enabled: bool):
         velocity = np.asarray(velocity, float)
         if velocity.shape != (3,) or not np.isfinite(velocity).all():
             raise ValueError("A finite 3D velocity command is required")
+        if not np.isfinite(duration) or duration <= 0 or not isinstance(enabled, (bool, np.bool_)):
+            raise ValueError("Velocity commands need a positive duration and boolean enable")
         velocity = clamp_norm(velocity, self.maximum_speed)
         state = self.state()
         if state.safety_mode not in {1, 2} or not enabled:
             self.stop()
             return False
-        self.commands.append({"timestamp": state.timestamp, "velocity": velocity.tolist(),
-                              "duration": duration, "executed": self.execute})
+        executed = False
         if self.execute:
-            # Rotational velocity remains zero; tool orientation is held by the robot controller.
-            self.control.speedL(np.r_[velocity, np.zeros(3)].tolist(), 0.3, duration)
-        return self.execute
+            executed = bool(self.control.speedL(np.r_[velocity, np.zeros(3)].tolist(), 0.3, duration))
+            if not executed:
+                self.stop()
+        self.commands.append({"timestamp": state.timestamp, "velocity": velocity.tolist(),
+                              "duration": duration, "executed": executed})
+        return executed
 
     def stop(self):
         if self.control is not None:
             self.control.speedStop(0.5)
 
     def close(self):
-        self.stop()
+        if self.closed:
+            return
+        errors = []
+        actions = []
         if self.control is not None:
-            self.control.stopScript()
-            self.control.disconnect()
-        self.receive.disconnect()
+            actions += [self.stop, self.control.stopScript, self.control.disconnect]
+        if self.receive is not None:
+            actions.append(self.receive.disconnect)
+        for action in actions:
+            try:
+                action()
+            except Exception as exc:
+                errors.append(exc)
+        self.closed = True
+        if errors:
+            raise RuntimeError("RTDE cleanup reported an error") from errors[0]
 
 
 class MasterUDP:
-    """SDK bridge packets include an optional displayed observation acknowledgement.
 
-    Host-local monotonic receive time governs the watchdog. Remote device clock
-    values are recorded, never subtracted from the host clock without synchronization.
-    """
+
+
+
+
     def __init__(self, port=55001, timeout=0.1):
+        if (not isinstance(port, int) or isinstance(port, bool) or not 0 <= port <= 65535
+                or not np.isfinite(timeout) or timeout <= 0):
+            raise ValueError("UDP port and watchdog timeout are invalid")
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind(("127.0.0.1", port))
-        self.socket.settimeout(timeout)
+        try:
+            self.socket.bind(("127.0.0.1", port))
+            self.socket.settimeout(timeout)
+        except BaseException:
+            self.socket.close()
+            raise
         self.last_sequence = -1
+        self.peer_address = None
 
-    def read(self):
-        raw, address = self.socket.recvfrom(8192)
+    def _decode(self, raw):
         data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Master packet must be a JSON object")
         sequence = data["sequence"]
         if (data["frame"] != "base" or not isinstance(sequence, int)
                 or isinstance(sequence, bool) or sequence <= self.last_sequence):
@@ -104,12 +148,42 @@ class MasterUDP:
                 raise ValueError(f"Invalid master signal {key}")
         if not isinstance(data["enable"], bool) or not isinstance(data["grip"], bool):
             raise ValueError("Master enable/grip must be boolean")
-        self.last_sequence = data["sequence"]
-        data["host_receive_monotonic"] = time.monotonic()
-        return data, address
+        return data
+
+    def read(self):
+        raw, address = self.socket.recvfrom(8192)
+        selected, selected_address = None, None
+        peer = self.peer_address
+        processed, invalid, foreign = 0, 0, 0
+        while True:
+            processed += 1
+            if peer is not None and address != peer:
+                foreign += 1
+            else:
+                try:
+                    packet = self._decode(raw)
+                except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+                    invalid += 1
+                else:
+                    if peer is None:
+                        peer = address
+                    if selected is None or packet["sequence"] > selected["sequence"]:
+                        packet["host_receive_monotonic"] = time.monotonic()
+                        selected, selected_address = packet, address
+            if processed >= 4096 or not select.select([self.socket], [], [], 0)[0]:
+                break
+            raw, address = self.socket.recvfrom(8192)
+        if selected is None:
+            raise ValueError("No valid fresh master command was available")
+        self.peer_address = selected_address
+        self.last_sequence = selected["sequence"]
+        selected["skipped_packets"] = processed - 1
+        selected["invalid_packets"] = invalid
+        selected["foreign_peer_packets"] = foreign
+        return selected, selected_address
 
     def reflect_force(self, force, address, feedback=None):
-        # Device-side actuator limits and interlocks remain part of the master SDK bridge.
+
         force = np.asarray(force, float)
         if force.shape != (3,) or not np.isfinite(force).all():
             raise ValueError("Reflected force must be a finite 3D vector")
@@ -139,7 +213,7 @@ class FeedbackFrame:
 
 
 class FeedbackLedger:
-    """Bounded sent-frame lookup; acknowledgements refer to host-owned timestamps."""
+
 
     def __init__(self, maximum_frames=4096):
         if not isinstance(maximum_frames, int) or maximum_frames < 1:
@@ -183,20 +257,96 @@ class FeedbackLedger:
 
 
 class RobotiqSocket:
-    """ASCII bridge used by the Robotiq URCap; explicitly selected, never assumed."""
-    def __init__(self, host, port=63352, execute=False):
+
+    def __init__(self, host, port=63352, execute=False, speed=64, force=64, timeout=1.0):
+        if (not isinstance(host, str) or not host or not isinstance(port, int)
+                or not 1 <= port <= 65535 or not np.isfinite(timeout) or timeout <= 0
+                or any(not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 255
+                       for value in (speed, force))):
+            raise ValueError("Invalid Robotiq endpoint or actuator parameters")
         self.host, self.port, self.execute = host, port, execute
+        self.speed, self.force, self.timeout = speed, force, timeout
+
+    def _exchange(self, command: str) -> str:
+        with socket.create_connection((self.host, self.port), timeout=self.timeout) as client:
+            client.sendall((command + "\n").encode("ascii"))
+            payload = b""
+            while len(payload) < 4096:
+                chunk = client.recv(1024)
+                if not chunk:
+                    break
+                payload += chunk
+                if b"\n" in payload or payload.strip().lower() == b"ack":
+                    break
+        reply = payload.decode("ascii").strip()
+        if not reply:
+            raise ConnectionError("The Robotiq endpoint returned no reply")
+        return reply
+
+    def _get(self, variable: str) -> int:
+        reply = self._exchange(f"GET {variable}")
+        match = re.fullmatch(rf"{variable}\s+(\d+)", reply)
+        if not match:
+            raise RuntimeError(f"Invalid Robotiq {variable} reply")
+        return int(match.group(1))
+
+    def _set(self, **variables):
+        command = "SET " + " ".join(f"{key} {value}" for key, value in variables.items())
+        reply = self._exchange(command)
+        if reply.lower() != "ack":
+            raise RuntimeError("The Robotiq endpoint rejected a command")
+        return command
+
+    def status(self) -> dict:
+        return {"active": self._get("ACT") == 1, "activation_status": self._get("STA"),
+                "fault": self._get("FLT"), "position": self._get("POS"),
+                "object_status": self._get("OBJ")}
+
+    def activate(self, timeout=10.0):
+        if not np.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Activation timeout must be positive")
+        if not self.execute:
+            return {"executed": False, "operation": "activate"}
+        status = self.status()
+        if status["active"] and status["activation_status"] == 3 and status["fault"] == 0:
+            return {"executed": False, "already_active": True, "status": status}
+        self._set(ACT=0)
+        deadline = time.monotonic() + timeout
+        while self._get("ACT") != 0:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Robotiq reset timed out")
+            time.sleep(.02)
+        self._set(ACT=1)
+        while time.monotonic() < deadline:
+            status = self.status()
+            if status["fault"] >= 8:
+                raise RuntimeError(f"Robotiq activation fault {status['fault']}")
+            if status["active"] and status["activation_status"] == 3 and status["fault"] == 0:
+                return {"executed": True, "status": status}
+            time.sleep(.02)
+        raise TimeoutError("Robotiq activation timed out")
 
     def command(self, closed: bool):
-        command = f"SET POS {255 if closed else 0} SPE 64 FOR 64 GTO 1\n"
+        if not isinstance(closed, bool):
+            raise ValueError("Gripper closed state must be boolean")
+        command = f"SET POS {255 if closed else 0} SPE {self.speed} FOR {self.force} GTO 1"
         if not self.execute:
-            return {"executed": False, "command": command.strip()}
-        with socket.create_connection((self.host, self.port), timeout=1) as client:
-            client.sendall(command.encode("ascii"))
-            reply = client.recv(1024).decode("ascii").strip()
-        if reply.lower() != "ack":
-            raise RuntimeError(f"Gripper rejected command: {reply}")
-        return {"executed": True, "reply": reply}
+            return {"executed": False, "command": command}
+        self._set(POS=255 if closed else 0, SPE=self.speed, FOR=self.force, GTO=1)
+        return {"executed": True, "command": command, "completion": "not_yet_measured"}
+
+    def wait_until_stopped(self, timeout=5.0) -> dict:
+        if not np.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Gripper motion timeout must be positive")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = self.status()
+            if status["fault"]:
+                raise RuntimeError(f"Robotiq motion fault {status['fault']}")
+            if status["object_status"] in {1, 2, 3}:
+                return status
+            time.sleep(.02)
+        raise TimeoutError("Robotiq motion did not complete before the timeout")
 
 
 def record_robot(host: str, samples: int, output: Path):

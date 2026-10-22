@@ -1,5 +1,3 @@
-"""Discrete DMP reference baseline fitted on the same bootstrap demonstrations."""
-
 from pathlib import Path
 
 import numpy as np
@@ -47,7 +45,7 @@ class DMP:
         return self
 
     def rollout(self, scene: Scene, goal: int):
-        # Integration is subdivided to resolve the stiff canonical spring dynamics.
+
         y, v = scene.start.copy(), np.zeros(3)
         target, path, dt = scene.goals[goal], [], 0.002
         scale = target - y

@@ -1,5 +1,3 @@
-"""Timestamped zero-order-hold buffers with explicit packet age."""
-
 from collections import deque
 from dataclasses import dataclass
 

@@ -1,5 +1,3 @@
-"""Nominal three-layer decisions shared by simulation and workstation replay."""
-
 import numpy as np
 
 from dasa.control.arbitration import CONDITIONS, Confidence, authority

@@ -1,160 +1,77 @@
 # Delay-Aware Shared Autonomy
 
-A modular Python engineering platform for delayed teleoperation, intent estimation,
-task-parameterized skill learning and shared-control experiments.
+Python 3.12 工程：延迟意图推断、TP-HSMM/LQT、共享控制、示范精炼、实机采集与统计。支持 Windows 10/11、Linux、UR10/UR10e RTDE、Robotiq URCap 夹爪及 Force Dimension DHD 主端，也可接入 UDP 主端。
 
-## Installation
+## 安装与仿真
 
-Python 3.12 x64 is required. CPU execution is supported; no GPU or background
-service is necessary. Scientific and RTDE dependencies are pinned with artifact hashes.
-
-Linux:
-
-```bash
-bash scripts/setup.sh
-source /workspace/.venvs/dasa/bin/activate
-dasa --profile configs/smoke.yaml run --output artifacts/example
-```
-
-For installations outside `/workspace`, choose a writable environment path:
-
-```bash
-DASA_VENV="$PWD/.venv" DASA_CACHE="$PWD/.cache/pip" bash scripts/setup.sh
-source .venv/bin/activate
-```
-
-Windows 10/11:
+Windows：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1 -Hardware
-powershell -ExecutionPolicy Bypass -File scripts/run_windows.ps1 -Profile smoke
+.\.venv\Scripts\Activate.ps1
+dasa --profile configs/smoke.yaml run --output artifacts/check
 ```
 
-Open the generated `report/index.html`. Each run uses a new output directory.
-The complete experiment configuration is `configs/default.yaml`; `smoke.yaml`
-reduces the training and evaluation budget for an installation check.
+Linux：`bash scripts/setup.sh`，随后激活 `/workspace/.venvs/dasa/bin/activate`。完整实验使用 `configs/default.yaml`；分项配置位于 `configs/experiments/`。轨迹、模型、统计及图像保存在指定输出目录。
 
-## Experiment specification
+## 真实实验
 
-Read [实验实施与数据记录细则](docs/experiment-details.md) for the complete operational
-definitions and [figure recipes](docs/figure-recipes.md) for Fig. 5, Fig. 6,
-Fig. 8 and learning commands. Supporting specifications cover the
-[actual training objective and architectures](docs/intent-model.md),
-[demonstration selection and weighted refitting](docs/skill-refinement.md),
-[RGB-D geometry and frozen scene manifests](docs/perception-scenes.md),
-[anonymous study procedure and statistical analysis](docs/human-study.md),
-[validation-only sensitivity experiments](docs/tuning.md) and
-[default values with units](docs/parameters.md).
-
-[Implementation validation](docs/validation.md) records the executed checks and
-observed simulation failures, including incomplete demonstration budgets.
-
-The reference cVAE optimizes `reconstruction_nll + kl_divergence` with unit
-weights and records both terms in a checkpoint-bound training audit. The explicitly
-named `legacy_objective.yaml` profile preserves the earlier weighted objective.
-Default values and prospective protocols describe this implementation; measured
-outcomes come from recorded data. Generated examples are labeled synthetic.
-
-## Components
-
-- Timestamped feedback and command channels, measured packet age, delay jitter and stale-packet handling.
-- Conditional variational encoding, causal latent goal priors and angular action likelihoods.
-- Boltzmann, memory, DMP, LSTM and causal Transformer estimation baselines.
-- Task-parameterized explicit-duration models, segment EM, online duration filtering and LQT.
-- Kalman force estimation, potential-field guidance, uncertainty arbitration and corrective priority.
-- Discrete robot-work storage constraints and coordinated force/velocity port regulation.
-- Demonstration admission, weighted skill updates, scenario generalization and paired statistical analysis.
-- UR10/UR10e kinematics, RTDE state/velocity interfaces, rigid calibration, UDP master bridge and recording import.
-
-## Commands
+设备地址通过 `--host` 输入；标定、相机内参和场景均使用现场测量文件。先生成实机配置：
 
 ```bash
-dasa --profile configs/smoke.yaml prepare --output artifacts/staged
-dasa --profile configs/smoke.yaml intent --output artifacts/staged
-dasa --profile configs/smoke.yaml sharing --output artifacts/staged
-dasa --profile configs/smoke.yaml refinement --output artifacts/staged
-dasa --profile configs/smoke.yaml stress --output artifacts/staged
-dasa --profile configs/smoke.yaml port-bench --output artifacts/staged/ports
-dasa --profile configs/smoke.yaml report --output artifacts/staged
-dasa --profile configs/smoke.yaml figures --output artifacts/staged
-dasa --profile configs/smoke.yaml audit-run --output artifacts/staged
-dasa validate-data artifacts/staged/dataset
-dasa protocol --output artifacts/specification
-dasa scene-manifest --scenario wider --count 100 --output artifacts/scenes/wider.json
+dasa calibrate data/raw/landmarks.json --output data/raw/calibration.json
+dasa perceive data/raw/rgbd.npz data/raw/perception.json --output data/raw/scene.json
+dasa hardware-config --host "$ROBOT_IP" --model UR10 --calibration data/raw/calibration.json --scene data/raw/scene.json --feedback-delay 0 --output configs/ur10.local.yaml
+dasa robot-read --host "$ROBOT_IP" --samples 100 --output artifacts/robot-state.json
+dasa gripper --host "$ROBOT_IP"
+dasa gripper --host "$ROBOT_IP" --activate --execute
 ```
 
-Run `dasa run --output artifacts/full` for the complete configured budget. All
-failures, admission rejections and unmet demonstration quotas remain in the outputs.
-Use `--profile configs/online.yaml` to enable causal duration-filter uncertainty.
+`landmarks.json` 包含 `camera_frame`、`camera_points_m[N,3]`、`base_points_m[N,3]`。RGB-D NPZ 包含 `rgb[H,W,3]`、`depth[H,W]`；感知配置提供针孔内参、深度尺度、标定变换及目标/障碍的颜色区间与几何尺寸。目标和障碍中心统一转换到机器人基坐标系，长度单位 m、力单位 N。
 
-Measured datasets use operator-disjoint `train`, `validation` and `test` entries
-in a `splits.json` file. Train and update them with:
+主端在独立终端运行。DHD 使用厂家 SDK 动态库，`rotation.json` 提供设备到基坐标系的正交 `rotation[3,3]`。按钮 0 为使能，按钮 1 控制抓取；输入为相对中性位置的虚拟弹簧指令，反馈为限幅后的机器人力：
 
 ```bash
-dasa train-data data/processed --output artifacts/measured
-dasa intent-recordings artifacts/measured --output artifacts/recorded-intent
-dasa refine-data data/processed data/raw/new_demos --output artifacts/updated
+dasa master-device --library "$DHD_LIBRARY" --rotation data/raw/rotation.json
 ```
 
-Training snapshots the declared dataset into the new run directory. Budget and
-generalization experiments consume ordered collections, preserve failed attempts,
-and evaluate bootstrap-only and first-success-prefix policies on shared frozen scenes:
+也可运行 Windows 键盘桥 `python scripts/master_keyboard.py`：WASD/QE 移动，空格使能，G 抓取，Esc 退出。UDP 主端报文包含 `sequence`、`frame=base`、`force_N[3]`、`velocity_m_s[3]`、`enable`、`grip`、`observation_sequence`；收到并显示反馈后回传帧编号。
+
+选择一个试次执行：
 
 ```bash
-dasa --profile configs/experiments/generalization.yaml generalization artifacts/measured data/collections --output artifacts/measured/generalization
-dasa --profile configs/experiments/sensitivity.yaml validation-sweep artifacts/measured --output artifacts/sensitivity
-dasa --profile configs/experiments/generalization.yaml figures --output artifacts/measured
 dasa study-schedule --output artifacts/study/schedule.csv
+dasa hardware-trial artifacts/study/schedule.csv --participant P01 --trial-id P01_r00_c00 --hardware configs/ur10.local.yaml --models artifacts/measured/models --output artifacts/hardware --execute
 ```
 
-Unmet successful-demonstration budgets are excluded from fixed-budget comparisons.
-Statistical exports include paired-unit effects and confidence intervals, raw p
-values, Holm adjustment, multiplicity families and missingness. Anonymous study
-and NASA-TLX imports consume recorded CSV data; no questionnaire data are generated.
+不加 `--execute` 时仅采集。单独采集可用 `robot-session`；`--skill` 可选择精炼模型。实机采用保持姿态的平移速度控制，包含限速、反馈确认、净空检查和看门狗。场景必须与所选试次的实测布局一致；代码测试不等同于设备现场验收。
 
-## Device integration
+首次零时延启动示范可用 `dasa robot-session --hardware configs/ur10.local.yaml --condition C1 --output data/raw/bootstrap-001.json --execute`，无需预训练模型。每个候选目标均应有成功启动示范；正式试次按计划表设置延迟。
 
-Copy `configs/hardware.example.yaml` to an untracked local configuration. Supply
-the controller IP, explicit UR10/UR10e model, measured base-frame scene,
-calibration record, device limits and gripper interface. Read-only acquisition:
+## 数据、训练与分析
+
+完成试次后输入独立判定结果，再导入训练数据：
 
 ```bash
-dasa robot-read --host <controller-IP> --samples 100 --output artifacts/robot-state.json
+dasa annotate-recording recording.json --episode P01_r00_c00 --operator P01 --goal 0 --grasped-goal 0 --outcome success --output annotation.json
+dasa import-recording recording.json annotation.json --output data/study/recordings/P01_r00_c00.npz
+dasa measured-metrics data/study/recordings --output artifacts/study/trials.csv
+dasa validate-data data/processed
+dasa train-data data/processed --output artifacts/measured
+dasa intent-recordings artifacts/measured --output artifacts/intent
+dasa refine-data data/processed data/collections/r0/C3 --output artifacts/refined
+dasa --profile configs/experiments/generalization.yaml generalization artifacts/measured data/collections --output artifacts/measured/generalization
+dasa figures --output artifacts/measured
 ```
 
-The master SDK bridge sends ordered JSON packets to localhost UDP port 55001:
+启动示范放入 `data/processed`，正式试次放入 `data/study/recordings`，新增示范按重复和条件放入 `data/collections/r0/C3` 等目录。示范 NPZ 保存 `time`、`position`、`velocity`、`raw_force`、`observed_state`、`phase` 和 JSON `metadata`；`splits.json` 按操作者隔离 `train/validation/test`。新增成功示范与原始数据加权重训，不足配额的结果不进入固定预算比较。cVAE 目标为 `reconstruction_nll + kl_divergence`，训练分量与模型校验值一并保存。
 
-```json
-{"sequence":1,"device_timestamp":0.02,"frame":"base","force_N":[0,0,0],"velocity_m_s":[0,0,0],"enable":false,"grip":false}
-```
+匿名试次及 NASA-TLX CSV 格式见 `study/` 的字段文件。使用 `study-analyze` 分析真实记录，输出配对置换检验、Holm 校正、效应量和置信区间；`validation-sweep` 仅使用验证集。仿真与实测数据保留独立来源标记。
 
-The device bridge performs axis calibration and applies its actuator limits.
-`scripts/master_keyboard.py` provides Windows command-input checks without haptic output.
-`robot-session` defaults to acquisition without motion; `--execute` explicitly
-enables RTDE motion and the selected gripper interface. `robot-replay` evaluates
-the nominal controller offline. `import-recording` requires independent task annotations.
-
-The simulator uses a translational point-mass plant, spherical obstacles and an
-abstract grasp/lift/place state machine. Its energy inequality applies to that
-discrete plant. Windows velocity control is a different execution interface;
-hardware cadence, collisions, force limits and port-energy behavior require device
-validation. Potential-field guidance alone does not guarantee collision avoidance.
-The multiport controller assumes held measured effort/flow values over each sample.
-
-## Layout and checks
-
-`src/dasa/models` contains learned and movement models; `control` contains
-arbitration and energy regulation; `robotics` contains device interfaces. Data,
-experiments, statistics and reporting have independent modules. `configs`,
-`scripts`, `study` and `tests` contain execution settings, entry points, empty
-data-contract templates and automated checks. Generated data and local hardware
-settings are excluded from version control.
+## 检查与打包
 
 ```bash
 python -m pytest -q
 ruff check src tests scripts
 python scripts/package.py --output artifacts/project.zip
 ```
-
-The source bundle includes code, configuration, tests and operational templates.
-Experimental records, trained models and private notes are not included by default.

@@ -10,7 +10,8 @@ import yaml
 
 from dasa.data import Demonstration
 from dasa.robotics.interfaces import FeedbackLedger, MasterUDP, RobotState
-from dasa.robotics.session import import_recording, run_workstation
+from dasa.robotics.session import ManualController, admittance_velocity, import_recording, run_workstation
+from dasa.robotics.configuration import default_profile
 
 
 def test_feedback_ledger_preserves_exact_sent_state_and_bounds_history():
@@ -71,24 +72,30 @@ class _Clock:
 
 
 @pytest.mark.parametrize("send_acknowledgement", [False, True])
+@pytest.mark.parametrize("release_grip", [False, True])
+@pytest.mark.parametrize("manual_bootstrap", [False, True])
 def test_workstation_requires_real_feedback_acknowledgement_and_delays_wrench(
-        config, tmp_path, monkeypatch, send_acknowledgement):
+        config, tmp_path, monkeypatch, send_acknowledgement, release_grip, manual_bootstrap):
     from dasa.robotics import session
-    hardware = yaml.safe_load((Path(__file__).resolve().parents[1]
-                               / "configs/hardware.example.yaml").read_text())
+    hardware = default_profile(config)
     hardware["robot"]["host"] = "test.invalid"
-    hardware["scene"]["provenance"] = "calibrated_scene"
+    hardware["scene"] = _recording_and_annotation(config)[0]["scene"]
+    hardware["gripper"]["type"] = "external"
     hardware.update(maximum_seconds=.24, feedback_delay_seconds=.04)
     calibration = tmp_path / "calibration.json"
-    calibration.write_text(json.dumps({"target_frame": "base", "rms_m": .001}))
+    calibration.write_text(json.dumps({"source_frame": "camera_optical", "target_frame": "base",
+                                       "transform": np.eye(4).tolist(), "rms_m": .001}))
     hardware["calibration_record"] = str(calibration)
     hardware_path = tmp_path / "hardware.yaml"
     hardware_path.write_text(yaml.safe_dump(hardware))
     clock = _Clock()
     monkeypatch.setattr(session.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(session.time, "sleep", clock.sleep)
-    monkeypatch.setattr(session.TPHSMM, "load", lambda *args: object())
-    monkeypatch.setattr(session, "load_models", lambda *args: (object(), None))
+    def forbidden_loader(*args):
+        raise AssertionError("Manual acquisition must not access learned models")
+
+    monkeypatch.setattr(session.TPHSMM, "load", forbidden_loader if manual_bootstrap else lambda *args: object())
+    monkeypatch.setattr(session, "load_models", forbidden_loader if manual_bootstrap else lambda *args: (object(), None))
     monkeypatch.setattr(session, "jacobian", lambda *args: np.eye(6))
 
     class Controller:
@@ -126,7 +133,8 @@ def test_workstation_requires_real_feedback_acknowledgement_and_delays_wrench(
                                if send_acknowledgement and self.feedback else None)
             self.sequence += 1
             return {"sequence": self.sequence, "force_N": [1, 0, 0],
-                    "velocity_m_s": [0, 0, 0], "enable": True, "grip": False,
+                    "velocity_m_s": [0, 0, 0], "enable": True,
+                    "grip": release_grip and 4 <= self.sequence < 6,
                     "host_receive_monotonic": clock.monotonic(),
                     "observation_sequence": acknowledgement}, ("127.0.0.1", 1)
 
@@ -139,17 +147,33 @@ def test_workstation_requires_real_feedback_acknowledgement_and_delays_wrench(
     monkeypatch.setattr(session, "URRTDE", Robot)
     monkeypatch.setattr(session, "MasterUDP", Master)
     monkeypatch.setattr(session, "HierarchicalController", Controller)
+    (tmp_path / "bootstrap_hsmm.npz").write_bytes(b"test fixture")
+    refined = tmp_path / "refined_hsmm.npz"
+    refined.write_bytes(b"refined fixture")
     output = tmp_path / "recording.json"
-    run_workstation(config, hardware_path, tmp_path, output, execute=True)
+    run_workstation(config, hardware_path, None if manual_bootstrap else tmp_path, output,
+                     execute=True, condition="C1" if manual_bootstrap else "C3",
+                     skill_path=refined if release_grip and not manual_bootstrap else None)
     result = json.loads(output.read_text())
     samples = result["samples"]
     assert samples and samples[0]["observed_state"] is None
     assert all(not sample["executed"] for sample in samples if not sample["feedback_acknowledged"])
     assert "test.invalid" not in output.read_text()
+    if manual_bootstrap:
+        assert result["controller_mode"] == "manual_bootstrap" and result["model_hashes"] == {}
+        assert "skill_file" not in result and "skill_sha256" not in result
+        assert all("posterior" not in decision and "latent" not in decision
+                   for decision in result["decisions"] if decision is not None)
+    else:
+        assert result["controller_mode"] == "trained_shared_control"
+        assert result["skill_file"] == ("refined_hsmm.npz" if release_grip else "bootstrap_hsmm.npz")
     if send_acknowledgement:
         assert any(sample["executed"] for sample in samples)
+        if release_grip:
+            assert result["stop_reason"] == "gripper_release"
+            assert samples[-1]["phase_after_action"] == 3
         for sample in samples:
-            if sample["executed"]:
+            if sample["executed"] and sample["phase_after_action"] != 3:
                 assert sample["feedback_age"] >= .04
                 assert sample["delayed_feedback_wrench"][0] < sample["measured_wrench"][0]
                 assert sample["reflected_force"][0] == -min(
@@ -233,3 +257,69 @@ def test_keyboard_echoes_only_rendered_feedback(capsys):
 
     assert module.receive_displayed_feedback(Socket()) == 0
     assert "delayed TCP" in capsys.readouterr().out
+
+
+def test_udp_burst_selects_newest_valid_command_and_preserves_peer():
+    master = MasterUDP(port=0, timeout=.2)
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    packet = {"frame": "base", "force_N": [1, 0, 0], "velocity_m_s": [0, 0, 0],
+              "enable": True, "grip": False, "observation_sequence": 0}
+    try:
+        target = master.socket.getsockname()
+        for sequence in (0, 2, 1, 4):
+            client.sendto(json.dumps({**packet, "sequence": sequence}).encode(), target)
+        client.sendto(b"invalid JSON", target)
+        received, address = master.read()
+        assert received["sequence"] == 4
+        assert received["skipped_packets"] == 4 and received["invalid_packets"] == 1
+        other.sendto(json.dumps({**packet, "sequence": 9000}).encode(), target)
+        client.sendto(json.dumps({**packet, "sequence": 5}).encode(), target)
+        received, current_address = master.read()
+        assert received["sequence"] == 5 and received["foreign_peer_packets"] == 1
+        assert current_address == address
+        client.sendto(json.dumps({**packet, "sequence": 3}).encode(), target)
+        with pytest.raises(ValueError, match="fresh master"):
+            master.read()
+    finally:
+        client.close()
+        other.close()
+        master.close()
+
+
+def test_manual_controller_has_filtered_bounded_human_force_only(config):
+    selected = copy.deepcopy(config)
+    selected["simulation"]["force_limit"] = .25
+    controller = ManualController(selected)
+    decision = controller.decide([10., 0, 0], np.zeros(6), np.zeros(6), 0., 0, None, 0.)
+    assert 0 < decision["human_force"][0] < 10
+    assert np.linalg.norm(decision["nominal_force"]) == pytest.approx(.25)
+    assert set(decision) == {"human_force", "nominal_force", "alpha", "lambda"}
+    assert decision["alpha"] == decision["lambda"] == 0
+
+
+@pytest.mark.parametrize("condition,skill", [("C2", None), ("C3", None), ("C1", Path("skill.npz"))])
+def test_nonmanual_model_free_acquisition_is_rejected_before_device_access(
+        config, tmp_path, monkeypatch, condition, skill):
+    from dasa.robotics import session
+
+    def forbidden(*args):
+        raise AssertionError("Invalid acquisition must fail before reading device configuration")
+
+    monkeypatch.setattr(session, "load_hardware", forbidden)
+    with pytest.raises(ValueError, match="manual C1"):
+        run_workstation(config, tmp_path / "hardware.yaml", None,
+                          tmp_path / "raw.json", condition=condition, skill_path=skill)
+
+
+def test_admittance_midpoint_damping_work_balance(config):
+    velocity = np.array([.10, -.08, .03])
+    force = np.array([.5, .2, -.1])
+    dt, mass, damping = .02, config["simulation"]["mass"], config["simulation"]["damping"]
+    following = admittance_velocity(force, velocity, config, dt, maximum_speed=10.)
+    midpoint = (following + velocity) / 2
+    kinetic_change = .5 * mass * (following @ following - velocity @ velocity)
+    assert kinetic_change == pytest.approx(dt * force @ midpoint - dt * damping * (midpoint @ midpoint))
+    damped = admittance_velocity(np.zeros(3), velocity, config, dt, maximum_speed=10.)
+    assert np.linalg.norm(damped) < np.linalg.norm(velocity)
+    assert np.linalg.norm(admittance_velocity([100, 0, 0], np.zeros(3), config, dt)) == pytest.approx(.08)

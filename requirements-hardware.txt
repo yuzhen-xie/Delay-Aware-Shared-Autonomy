@@ -1,4 +1,3 @@
-# Optional RTDE bridge; NumPy is provided by requirements.lock.
 ur-rtde==1.6.2 \
     --hash=sha256:07a5e82b8b2914ccb18a11a7600ab142b9cae5d3e48c08a0f3343a4257749a9f \
     --hash=sha256:0e76dc5273fa9830ffb6d65c210629736cae1d2597b6e1e16f79da9e6a4b8d00 \

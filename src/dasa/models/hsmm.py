@@ -1,10 +1,3 @@
-"""Task-parameterized explicit-duration HMM and covariance-weighted LQT.
-
-Each task frame defines a Gaussian expert. Their precision-weighted product gives
-the world-frame emission distribution. Forward/backward segment recursions use
-explicit, truncated discrete-Gaussian dwell times and left-to-right transitions.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -22,7 +15,7 @@ from dasa.geometry import Scene, task_frames
 
 
 def demonstration_fingerprint(demo: Demonstration) -> dict:
-    """Hashes numerical signals independently of labels to detect renamed copies."""
+
     demo.validate()
     digest = hashlib.sha256()
     for key in ("time", "position", "velocity", "raw_force", "observed_state", "phase"):
@@ -64,11 +57,11 @@ def duration_logpmf(mean: float, std: float, maximum: int) -> np.ndarray:
 
 
 def segment_posterior(log_emission: np.ndarray, duration: np.ndarray):
-    """Exact segment EM under a left-to-right, no-skip topology.
 
-    All K states must be visited. The final segment must end at T, so the
-    likelihood is conditional on a complete task trajectory of observed length.
-    """
+
+
+
+
     t_count, states = log_emission.shape
     max_duration = duration.shape[1]
     cumulative = np.vstack([np.zeros(states), np.cumsum(log_emission, axis=0)])
@@ -184,9 +177,9 @@ class TPHSMM:
                                  for m, s in zip(self.duration_mean, self.duration_std)])
             responsibilities, counts, likelihood = [], np.zeros_like(duration), 0.0
             for w, x in zip(weights, local):
-                # Fit the frame-factorized emission objective. Normalized Gaussian
-                # products are used for task adaptation, not silently substituted
-                # into an M-step derived for independent frame factors.
+
+
+
                 emission = np.stack([sum(gaussian_logpdf(x[:, frame], self.means[k, frame],
                                                         self.covariances[k, frame])
                                             for frame in range(3)) for k in range(self.k)], -1)
@@ -218,7 +211,7 @@ class TPHSMM:
         return self
 
     def state_sequence(self, scene: Scene, goal: int) -> np.ndarray:
-        """Maximum-probability duration sequence with the horizon fixed to samples."""
+
         duration = np.array([duration_logpmf(m, s, self.samples)
                              for m, s in zip(self.duration_mean, self.duration_std)])
         dp = np.full((self.k + 1, self.samples + 1), -np.inf)
@@ -291,12 +284,12 @@ class TPHSMM:
 
 
 def refine(config: dict, original: list[Demonstration], candidates: list[Demonstration]):
-    """Refit on the original data and the first eligible, unique successes.
 
-    Candidate order is acquisition order supplied by the caller, never ranked by
-    subsequent evaluation outcomes. A short quota is retained as an incomplete
-    diagnostic fit; callers must exclude it from equal-budget inference.
-    """
+
+
+
+
+
     accepted, audit = [], []
     quota = config["skill"]["refinement_count"]
     if not isinstance(quota, int) or quota < 0:

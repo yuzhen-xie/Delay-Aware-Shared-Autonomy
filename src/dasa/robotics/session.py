@@ -1,38 +1,60 @@
-"""Workstation loop and offline replay of the same nominal hierarchy.
-
-The workstation performs translational admittance at a measured host cadence.
-Its velocity interface is not the simulated force plant. Hardware energy traces
-are observations and must not be reported as the simulation's passivity theorem.
-"""
-
 from __future__ import annotations
 
 import copy
 import hashlib
 import json
 import socket
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
-import yaml
 
 from dasa.config import write_json
 from dasa.control.hierarchy import HierarchicalController
+from dasa.control.motion import ForceKalman
 from dasa.data import Demonstration
 from dasa.delay import DelayBuffer
 from dasa.geometry import Scene, clamp_norm
 from dasa.models.hsmm import TPHSMM
 from dasa.models.intent import load_models
 from dasa.robotics.interfaces import FeedbackLedger, MasterUDP, RobotiqSocket, URRTDE
+from dasa.robotics.configuration import load_hardware
 from dasa.robotics.kinematics import jacobian
 from dasa.simulation import Trial
 
 
-def replay(config: dict, models: Path, trial_path: Path, output: Path, condition="C3"):
+class ManualController:
+    def __init__(self, config: dict):
+        self.maximum_force = config["simulation"]["force_limit"]
+        self.kalman = ForceKalman(config["motion"]["kalman_process"],
+                                  config["motion"]["kalman_measurement"],
+                                  config["motion"].get("kalman_initial_variance", 1.0))
+
+    def decide(self, raw, observed, current, age, phase, grasped_goal, rho):
+        human = self.kalman.step(np.asarray(raw, float))
+        return {"human_force": human,
+                "nominal_force": clamp_norm(human, self.maximum_force),
+                "alpha": 0.0, "lambda": 0.0}
+
+
+def admittance_velocity(force, velocity, config: dict, dt: float, maximum_speed=.08):
+    force, velocity = np.asarray(force, float), np.asarray(velocity, float)
+    mass, damping = config["simulation"]["mass"], config["simulation"]["damping"]
+    if (force.shape != (3,) or velocity.shape != (3,)
+            or not np.isfinite(np.r_[force, velocity, mass, damping, dt, maximum_speed]).all()
+            or mass <= 0 or damping < 0 or dt <= 0 or maximum_speed <= 0):
+        raise ValueError("Admittance needs finite 3D signals and positive mass, step and speed limit")
+    desired = ((2 * mass - dt * damping) * velocity + 2 * dt * force) / (2 * mass + dt * damping)
+    return clamp_norm(desired, maximum_speed)
+
+
+def replay(config: dict, models: Path, trial_path: Path, output: Path, condition="C3",
+           skill_path: Path | None = None):
     trial = Trial.load(trial_path)
     scene = Scene.from_dict(trial.metadata["scene"])
-    skill = TPHSMM.load(config, models / "bootstrap_hsmm.npz")
+    skill_file = Path(skill_path) if skill_path is not None else models / "bootstrap_hsmm.npz"
+    skill = TPHSMM.load(config, skill_file)
     cvae, _ = load_models(config, models)
     controller = HierarchicalController(config, scene, skill, cvae, condition)
     records, grasped = [], None
@@ -45,57 +67,67 @@ def replay(config: dict, models: Path, trial_path: Path, output: Path, condition
         decision = controller.decide(a["raw_force"][k], a["observed_state"][k], current,
                                      a["feedback_age"][k], phase, grasped, a["rho"][k],
                                      bool(a["corrective"][k]))
-        velocity = clamp_norm(a["velocity"][k] + config["simulation"]["decision_dt"] *
-                              decision["nominal_force"] / config["simulation"]["mass"], .08)
+        velocity = admittance_velocity(decision["nominal_force"], a["velocity"][k], config,
+                                        config["simulation"]["decision_dt"])
         records.append({"time": a["time"][k], "nominal_force": decision["nominal_force"],
                         "bounded_velocity": velocity, "motion_sent": False})
-    write_json(output, {"mode": "offline_replay", "condition": condition, "records": records})
+    write_json(output, {"mode": "offline_replay", "condition": condition, "records": records,
+                        "skill_file": skill_file.name,
+                        "skill_sha256": hashlib.sha256(skill_file.read_bytes()).hexdigest()})
 
 
-def run_workstation(config: dict, hardware_file: Path, models: Path, output: Path,
-                    execute=False, condition="C3"):
-    hardware = yaml.safe_load(hardware_file.read_text(encoding="utf-8"))
-    if hardware["robot"]["host"] == "TO_FILL":
-        raise ValueError("Set the actual controller IP in the hardware configuration")
-    if hardware["scene"]["provenance"] != "calibrated_scene":
-        raise ValueError("A measured base-frame scene is required for workstation operation")
+def run_workstation(config: dict, hardware_file: Path, models: Path | None, output: Path,
+                    execute=False, condition="C3", skill_path: Path | None = None):
+    if models is None and (condition != "C1" or skill_path is not None):
+        raise ValueError("Model-free acquisition supports manual C1 without a learned skill")
+    hardware = load_hardware(hardware_file)
     scene = Scene.from_dict(hardware["scene"])
-    if not hardware.get("calibration_record") or not Path(hardware["calibration_record"]).exists():
-        raise ValueError("An existing camera/task calibration record is required")
-    calibration = json.loads(Path(hardware["calibration_record"]).read_text())
-    if calibration["target_frame"] != "base" or calibration["rms_m"] > hardware["limits"]["calibration_rms_m"]:
-        raise ValueError("Calibration record is inconsistent or exceeds the allowed residual")
     acknowledgement_deadline = hardware["limits"].get(
         "feedback_acknowledgement_seconds", hardware["limits"]["watchdog_seconds"])
-    if (hardware["feedback_delay_seconds"] < 0 or acknowledgement_deadline <= 0
-            or hardware["loop_seconds"] <= 0 or not np.isfinite(
-                [hardware["feedback_delay_seconds"], acknowledgement_deadline,
-                 hardware["loop_seconds"]]).all()):
-        raise ValueError("Feedback delay, host cadence and acknowledgement deadline must be finite and valid")
-    skill = TPHSMM.load(config, models / "bootstrap_hsmm.npz")
-    cvae, _ = load_models(config, models)
     c = copy.deepcopy(config)
     c["simulation"]["decision_dt"] = hardware["loop_seconds"]
-    controller = HierarchicalController(c, scene, skill, cvae, condition)
-    if hardware["gripper"]["type"] not in {"robotiq_socket", "external"}:
-        raise ValueError("Select robotiq_socket or an independently controlled external gripper")
-    robot = URRTDE(hardware["robot"]["host"], execute, hardware["limits"]["maximum_speed_m_s"])
+    model_hashes = {}
+    skill_file, skill_digest = None, None
+    if models is None:
+        controller = ManualController(c)
+        controller_mode = "manual_bootstrap"
+    else:
+        models = Path(models)
+        skill_file = Path(skill_path) if skill_path is not None else models / "bootstrap_hsmm.npz"
+        skill_digest = hashlib.sha256(skill_file.read_bytes()).hexdigest()
+        skill = TPHSMM.load(config, skill_file)
+        cvae, _ = load_models(config, models)
+        controller = HierarchicalController(c, scene, skill, cvae, condition)
+        controller_mode = "trained_shared_control"
+        model_hashes = {"skill": skill_digest, **{
+            name: hashlib.sha256((models / name).read_bytes()).hexdigest()
+            for name in ("cvae.pt", "lstm.pt", "transformer.pt") if (models / name).is_file()}}
+    robot, master, gripper = None, None, None
+    address = None
+    samples, commands, gripper_commands = [], [], []
+    reflection_work, stop_reason = 0.0, "initialization"
+    cleanup_errors = []
     try:
+        robot = URRTDE(hardware["robot"]["host"], execute, hardware["limits"]["maximum_speed_m_s"])
         master = MasterUDP(hardware["master"]["udp_port"], hardware["limits"]["watchdog_seconds"])
-    except Exception:
-        robot.close()
-        raise
-    gripper = None
-    if hardware["gripper"]["type"] == "robotiq_socket":
-        gripper = RobotiqSocket(hardware["robot"]["host"], hardware["gripper"]["port"], execute)
-    initial = robot.state()
-    observations = DelayBuffer(np.r_[initial.position, initial.velocity, initial.wrench],
-                               hardware["feedback_delay_seconds"] + 1)
-    feedback_frames = FeedbackLedger()
-    started, phase, grasped, grip_previous = time.monotonic(), 0, None, False
-    samples, commands, reflection_work, stop_reason = [], [], 0.0, "duration"
-    previous_receive_time, previous_reflected = started, np.zeros(3)
-    try:
+        if hardware["gripper"]["type"] == "robotiq_socket":
+            gc = hardware["gripper"]
+            gripper = RobotiqSocket(hardware["robot"]["host"], gc["port"], execute,
+                                     gc.get("speed", 64), gc.get("force", 64),
+                                     gc.get("timeout_seconds", 1.0))
+            if execute:
+                status = gripper.status()
+                if not status["active"] or status["activation_status"] != 3 or status["fault"]:
+                    raise RuntimeError("Activate the Robotiq gripper before starting a measured trial")
+        initial = robot.state()
+        if np.linalg.norm(initial.position - scene.start) > hardware["limits"].get("start_tolerance_m", .05):
+            raise ValueError("Measured TCP position exceeds the declared initial-pose tolerance")
+        observations = DelayBuffer(np.r_[initial.position, initial.velocity, initial.wrench],
+                                   hardware["feedback_delay_seconds"] + 1)
+        feedback_frames = FeedbackLedger()
+        started, phase, grasped, grip_previous = time.monotonic(), 0, None, False
+        previous_receive_time, previous_reflected = started, np.zeros(3)
+        stop_reason = "duration"
         while time.monotonic() - started < hardware["maximum_seconds"]:
             tick = time.monotonic()
             state = robot.state()
@@ -138,9 +170,10 @@ def run_workstation(config: dict, hardware_file: Path, models: Path, output: Pat
                 feedback_age = received_time - acknowledged.host_source_time
                 decision = controller.decide(raw, observed, np.r_[state.position, state.velocity],
                                              feedback_age, phase, grasped, 0.0)
-                desired = clamp_norm(state.velocity + hardware["loop_seconds"] * decision["nominal_force"] /
-                                      c["simulation"]["mass"], hardware["limits"]["maximum_speed_m_s"])
-            # Stop before entry into an inflated obstacle; this is a workstation interlock.
+                desired = admittance_velocity(decision["nominal_force"], state.velocity, c,
+                                                hardware["loop_seconds"],
+                                                hardware["limits"]["maximum_speed_m_s"])
+
             next_position = state.position + desired * hardware["limits"]["watchdog_seconds"]
             clearance = scene.swept_clearance(state.position, next_position,
                                               c["simulation"]["robot_radius"] + hardware["limits"]["obstacle_margin_m"])
@@ -149,14 +182,14 @@ def run_workstation(config: dict, hardware_file: Path, models: Path, output: Pat
             executed = robot.speed(desired, hardware["loop_seconds"], enabled)
             if enabled and (executed or not execute) and packet["grip"] != grip_previous:
                 if gripper:
-                    gripper.command(packet["grip"])
+                    gripper_commands.append({"time": elapsed, **gripper.command(packet["grip"])})
                 grip_previous = packet["grip"]
                 if grip_previous:
                     grasped = int(np.argmin(np.linalg.norm(scene.goals - state.position, axis=1)))
                     phase = 1
                 elif phase >= 1:
                     phase = 3
-            # A real sample must first spend the declared interval in the host buffer.
+
             feedback_ready = elapsed - delayed.source_time >= hardware["feedback_delay_seconds"] - 1e-9
             feedback = None
             if feedback_ready:
@@ -164,7 +197,7 @@ def run_workstation(config: dict, hardware_file: Path, models: Path, output: Pat
                                                   delayed.source_time,
                                                   started + delayed.source_time, time.monotonic())
             reflected = clamp_norm(-delayed.state[6:9], hardware["limits"]["maximum_reflection_force_N"])
-            if not enabled or not executed or feedback is None:
+            if not enabled or not executed or feedback is None or phase == 3:
                 reflected = np.zeros(3)
             master.reflect_force(reflected, address, feedback.payload() if feedback else None)
             previous_reflected = reflected.copy()
@@ -178,7 +211,10 @@ def run_workstation(config: dict, hardware_file: Path, models: Path, output: Pat
                             "sent_observation_sequence": feedback.observation_sequence if feedback else None,
                             "sent_feedback_source_time": feedback.source_time if feedback else None,
                             "master_sequence": packet["sequence"],
+                            "master_skipped_packets": packet.get("skipped_packets", 0),
+                            "master_invalid_packets": packet.get("invalid_packets", 0),
                             "host_receive_time": received_time - started, "phase": phase_at_decision,
+                            "phase_after_action": phase,
                             "measured_wrench": state.wrench,
                             "delayed_feedback_wrench": delayed.state[6:],
                             "reflected_force": reflected,
@@ -187,6 +223,10 @@ def run_workstation(config: dict, hardware_file: Path, models: Path, output: Pat
                             "actual_cadence_seconds": time.monotonic() - tick,
                             "enabled": enabled, "executed": bool(executed)})
             commands.append(decision)
+            if phase == 3:
+                robot.stop()
+                stop_reason = "gripper_release"
+                break
             remaining = hardware["loop_seconds"] - (time.monotonic() - tick)
             if remaining > 0:
                 time.sleep(remaining)
@@ -194,12 +234,37 @@ def run_workstation(config: dict, hardware_file: Path, models: Path, output: Pat
                 robot.stop()
                 stop_reason = "host_cadence_watchdog"
                 break
+    except BaseException as exc:
+        stop_reason = f"exception_{type(exc).__name__}"
+        raise
     finally:
-        robot.close()
-        master.close()
+        unwinding = sys.exc_info()[0] is not None
+        if master is not None and address is not None:
+            try:
+                master.reflect_force(np.zeros(3), address, feedback=None)
+            except Exception as exc:
+                cleanup_errors.append({"device": "master_zero_force", "error_type": type(exc).__name__})
+        for name, device in (("robot", robot), ("master", master)):
+            if device is not None:
+                try:
+                    device.close()
+                except Exception as exc:
+                    cleanup_errors.append({"device": name, "error_type": type(exc).__name__})
         write_json(output, {"schema_version": 2, "provenance": "UR10_workstation_measurement",
                             "execute": execute, "condition": condition, "stop_reason": stop_reason,
                             "scene": scene.to_dict(), "samples": samples, "decisions": commands,
+                            "controller_mode": controller_mode, "model_hashes": model_hashes,
+                            **({"skill_file": skill_file.name, "skill_sha256": skill_digest}
+                               if skill_file is not None else {}),
+                            "calibration_sha256": hardware["calibration_sha256"],
+                            "snapshot_sha256": hardware.get("snapshot_sha256"),
+                            "gripper_commands": gripper_commands, "cleanup_errors": cleanup_errors,
+                            "execution_contract": {
+                                "maximum_seconds": hardware["maximum_seconds"],
+                                "robot_radius_m": c["simulation"]["robot_radius"],
+                                "place_tolerance_m": c["simulation"]["place_tolerance"],
+                                "workspace_min_m": hardware["limits"]["workspace_min_m"],
+                                "workspace_max_m": hardware["limits"]["workspace_max_m"]},
                             "timing": {"feedback_delay_seconds": hardware["feedback_delay_seconds"],
                                        "feedback_channels": ["cartesian_state", "measured_wrench"],
                                        "feedback_definition": "one_way_host_buffer_then_bridge_acknowledgement",
@@ -210,6 +275,8 @@ def run_workstation(config: dict, hardware_file: Path, models: Path, output: Pat
                             "outcome": "requires_independent_task_annotation",
                             "reflection_work_scope": "host_interval_held_force_estimate_from_received_master_velocity",
                             "passivity_scope": "measured trace only; no hardware passivity assertion"})
+        if cleanup_errors and not unwinding:
+            raise RuntimeError("Workstation device cleanup reported an error")
 
 
 def import_recording(recording: Path, annotations: Path, output: Path):
@@ -228,6 +295,14 @@ def import_recording(recording: Path, annotations: Path, output: Path):
             raise ValueError(f"Annotation {key} must be boolean")
     if "grasped_goal" not in metadata or (metadata["success"] and metadata["grasped_goal"] is None):
         raise ValueError("Record grasped_goal explicitly; successful trials require a grasped object ID")
+    assignment = data.get("experiment_assignment")
+    if assignment is not None:
+        for annotation_key, assignment_key in (("intended_goal", "intended_goal"),
+                                                ("operator_id", "participant_id"),
+                                                ("episode_id", "trial_id")):
+            if metadata[annotation_key] != assignment.get(assignment_key):
+                raise ValueError(f"Annotation {annotation_key} conflicts with the measured trial assignment")
+        metadata["experiment_assignment"] = assignment
     if data.get("schema_version", 0) < 2 or any(
             sample.get("executed") and sample.get("feedback_acknowledged") is not True
             for sample in samples):
@@ -262,9 +337,13 @@ def import_recording(recording: Path, annotations: Path, output: Path):
     if data.get("condition") != metadata["source_condition"]:
         raise ValueError("Annotated source condition must match the workstation recording")
     metadata["provenance"] = "UR10_measured_teleoperation"
+    metadata["controller_mode"] = data.get("controller_mode", "recording_mode_unspecified")
+    metadata["model_hashes"] = data.get("model_hashes", {})
     metadata["source_recording"] = str(recording)
     metadata["source_recording_sha256"] = hashlib.sha256(recording.read_bytes()).hexdigest()
     metadata["hardware_timing"] = timing
+    if "execution_contract" in data:
+        metadata["execution_contract"] = data["execution_contract"]
     metadata["feedback_timing_audit"] = {
         "initial_unacknowledged_samples": prefix,
         "clock": "host_session_relative_seconds",
@@ -276,7 +355,7 @@ def import_recording(recording: Path, annotations: Path, output: Path):
                           *[np.asarray([s[k] for s in samples]) for k in
                             ("position", "velocity", "raw_force", "observed_state", "phase")],
                           Scene.from_dict(data["scene"]), metadata.pop("intended_goal"), metadata)
-    # Preserve the standard demonstration schema and its validated timing extensions.
+
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = output.with_name(output.stem + ".import-source.npz")

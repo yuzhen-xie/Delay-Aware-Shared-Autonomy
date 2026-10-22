@@ -1,5 +1,3 @@
-"""UR10/UR10e nominal DH kinematics; calibration offsets are not inferred."""
-
 import numpy as np
 
 

@@ -1,5 +1,3 @@
-"""Versioned, constrained scene manifests with replayable sampling attempts."""
-
 from __future__ import annotations
 
 import hashlib
@@ -20,7 +18,7 @@ GENERATOR_VERSION = "constrained_translation_v1"
 
 @dataclass(frozen=True)
 class SceneConstraints:
-    """Declared benchmark geometry; these dimensions are not device measurements."""
+
 
     object_size_m: tuple[float, float, float] = (0.04, 0.04, 0.06)
     separation_margin_m: float = 0.005
@@ -52,7 +50,7 @@ def _default_constraints(config: dict) -> SceneConstraints:
 
 def validate_scene(scene: Scene, config: dict,
                    constraints: SceneConstraints | None = None) -> list[str]:
-    """Return constraint failures, including TCP swept paths, without changing a layout."""
+
     constraints = constraints or _default_constraints(config)
     constraints.validate()
     failures = []
@@ -109,7 +107,7 @@ def validate_scene(scene: Scene, config: dict,
 def generate_manifest(config: dict, count: int, scenario: str = "demonstrated",
                       seed: int | None = None,
                       constraints: SceneConstraints | None = None) -> dict:
-    """Sample accepted layouts in index order and retain the entire rejection ledger."""
+
     if scenario not in SCENARIOS:
         raise ValueError(f"Unknown scene scenario: {scenario}")
     if not isinstance(count, int) or count < 1:
@@ -161,7 +159,7 @@ def write_scene_manifest(config: dict, output: str | Path, count: int,
 
 
 def load_scene_manifest(path: str | Path) -> dict:
-    """Validate integrity and every accepted layout before returning a manifest."""
+
     result = json.loads(Path(path).read_text(encoding="utf-8"))
     if (result.get("schema_version") != SCHEMA_VERSION
             or result.get("generator_version") != GENERATOR_VERSION):

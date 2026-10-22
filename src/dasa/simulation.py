@@ -1,5 +1,3 @@
-"""Delayed 3D grasp/lift/place simulation and complete signal recording."""
-
 from __future__ import annotations
 
 import copy
@@ -164,7 +162,7 @@ def run_trial(config: dict, scene: Scene, skill, cvae, seed: int, intended_goal:
         force = nominal.copy()
         for substep in range(substeps):
             subtime = time + substep * dt
-            # Simulated master admittance supplies an explicit, separately recorded port flow.
+
             master_velocity = raw / 40.0 if not autonomous else np.zeros(3)
             energy = tank.step(subtime, nominal, v, human, master_velocity,
                                alpha, blend, rho, control.three_port)

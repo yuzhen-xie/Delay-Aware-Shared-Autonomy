@@ -1,5 +1,3 @@
-"""Dataset preparation, shared-control comparisons and independent policy refinement."""
-
 from __future__ import annotations
 
 import copy
@@ -11,7 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from dasa.config import manifest, seed_everything, write_json
-from dasa.data import Demonstration, generate_dataset, validate_partitions, synthetic_demonstration
+from dasa.data import (Demonstration, bootstrap_admission, generate_dataset,
+                       validate_partitions, synthetic_demonstration)
 from dasa.geometry import make_scene
 from dasa.metrics import intent_metrics, silhouette, trial_metrics
 from dasa.models.dmp import DMP, DMPIntent
@@ -35,7 +34,7 @@ def prepare(config: dict, root: Path):
 
 
 def snapshot_dataset(data: Path, root: Path) -> Path:
-    """Copy only declared split recordings into a portable prepared-run layout."""
+
     splits = json.loads((data / "splits.json").read_text())
     validate_partitions(data, splits)
     target = root / "dataset"
@@ -62,7 +61,9 @@ def train_dataset(config: dict, data: Path, root: Path):
     train, validation = load_split(data, "train"), load_split(data, "validation")
     models = root / "models"
     models.mkdir(parents=True, exist_ok=True)
+    admission = bootstrap_admission(train, config)
     skill = TPHSMM(config).fit(train)
+    skill.fit_manifest["bootstrap_admission"] = admission
     skill.save(models / "bootstrap_hsmm.npz")
     write_json(models / "hsmm_fit.json", skill.history)
     write_json(models / "bootstrap_inventory.json", skill.fit_manifest)
@@ -85,8 +86,11 @@ def train_dataset(config: dict, data: Path, root: Path):
 
 
 def refine_dataset(config: dict, data: Path, candidates: Path, output: Path):
+    from dasa.generalization import load_candidates
+
     original = load_split(data, "train")
-    new = [Demonstration.load(p) for p in sorted(candidates.glob("*.npz"))]
+    admission = bootstrap_admission(original, config)
+    new, candidate_files = load_candidates(candidates)
     held_out = load_split(data, "validation") + load_split(data, "test")
     held_out_operators = {d.metadata["operator_id"] for d in held_out}
     if any(d.metadata["operator_id"] in held_out_operators for d in new):
@@ -95,17 +99,20 @@ def refine_dataset(config: dict, data: Path, candidates: Path, output: Path):
     if any(demonstration_fingerprint(d)["signal_sha256"] in held_out_hashes for d in new):
         raise ValueError("Refinement signals overlap held-out partitions")
     model, audit, accepted = refine(config, original, new)
+    model.fit_manifest["bootstrap_admission"] = admission
     output.mkdir(parents=True, exist_ok=True)
     model.save(output / "refined_hsmm.npz")
     write_json(output / "selection_audit.json", audit)
     write_json(output / "training_inventory.json", model.fit_manifest)
     write_json(output / "manifest.json", manifest(config, "refine_dataset", [
-        data / "splits.json", *sorted(data.glob("*/*.npz")), *sorted(candidates.glob("*.npz"))]))
+        data / "splits.json", *sorted(data.glob("*/*.npz")), *candidate_files,
+        *([candidates / "order.json"] if (candidates / "order.json").exists() else [])]))
     write_json(output / "refinement_metadata.json", {
         "original_count": len(original), "candidate_count": len(new), "accepted_count": len(accepted),
         "required_count": config["skill"]["refinement_count"],
         "quota_met": len(accepted) == config["skill"]["refinement_count"],
-        "candidate_order": "filename_lexicographic_order",
+        "candidate_order": "order.json" if (candidates / "order.json").exists()
+        else "filename_lexicographic_order",
         "confirmatory_eligible": len(accepted) == config["skill"]["refinement_count"],
         "comparison_status": "eligible" if len(accepted) == config["skill"]["refinement_count"]
         else "diagnostic_only_incomplete_quota",
@@ -124,7 +131,7 @@ def sharing(config: dict, root: Path):
             seed = config["seed"] + 100000 + unit * 100 + repeat
             scene = make_scene(config, np.random.default_rng(seed))
             goal = (unit + repeat) % 3
-            # All conditions receive the same scene, operator seed and delay process.
+
             for delay in e["sharing_delays"]:
                 c = copy.deepcopy(config)
                 c["simulation"]["feedback_delay"] = delay
@@ -205,11 +212,12 @@ def refinement_experiment(config: dict, root: Path):
     if not original or not all(d.metadata["provenance"].startswith("synthetic") for d in original):
         raise ValueError("Simulation refinement requires synthetic bootstrap; "
                          "measured collections use refine-data/generalization")
+    bootstrap_admission(original, config)
     cvae, _ = load_models(config, root / "models")
     rows, audits, budgets = [], [], []
     e = config["experiments"]
     for repeat in range(e["independent_repeats"]):
-        # Independent bootstrap perturbation and training fit per replicate; shared across C1-C3.
+
         seed_everything(config["seed"] + 300000 + repeat)
         bootstrap = []
         for j, demo in enumerate(original):
@@ -217,7 +225,9 @@ def refinement_experiment(config: dict, root: Path):
                                         f"synthetic_boot_r{repeat}_{j % 5}",
                                         f"bootstrap_r{repeat}_{j}", demo.goal)
             bootstrap.append(d)
+        admission = bootstrap_admission(bootstrap, config)
         base = TPHSMM(config).fit(bootstrap)
+        base.fit_manifest["bootstrap_admission"] = admission
         for d in bootstrap:
             d.save(root / f"refinement/bootstrap/r{repeat}/{d.metadata['episode_id']}.npz")
         base.save(root / f"refinement/models/bootstrap_r{repeat}.npz")
@@ -277,7 +287,7 @@ def refinement_experiment(config: dict, root: Path):
                               ["success_rate", "reference_error_m"], config,
                               family=f"refinement_{scenario}", planned_delays=[0.8])
         stats.extend([{**r, "scenario": scenario} for r in results])
-    # Correct across all scenarios, rather than separately within each scenario.
+
     from dasa.statistics import holm
     corrected_values = holm([r["p_raw"] for r in stats], family_size=len(stats))
     for row, corrected in zip(stats, corrected_values):

@@ -1,5 +1,3 @@
-"""Create a portable source bundle with an optional selected synthetic run."""
-
 import argparse
 import hashlib
 import json
@@ -14,7 +12,7 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     files = []
-    directories = ["src", "tests", "configs", "docs", "study", "scripts", ".github"]
+    directories = ["src", "tests", "configs", "study", "scripts", ".github"]
     for directory in directories:
         files.extend(p for p in (root / directory).rglob("*") if p.is_file()
                      and "__pycache__" not in p.parts and not p.name.endswith(".pyc")

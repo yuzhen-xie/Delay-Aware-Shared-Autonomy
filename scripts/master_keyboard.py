@@ -1,9 +1,3 @@
-"""Windows keyboard bridge for bench checks: WASD/QE, hold Space, G toggles grip.
-
-This bridge provides command inputs; it cannot render haptic forces. Device SDK
-bridges should follow the same packet format and supply measured master velocity.
-"""
-
 import argparse
 import json
 import socket
@@ -13,7 +7,7 @@ import numpy as np
 
 
 def receive_displayed_feedback(client, last_observation_sequence=None):
-    """Acknowledge only a feedback frame rendered by this diagnostic console."""
+
     current = last_observation_sequence
     while True:
         try:

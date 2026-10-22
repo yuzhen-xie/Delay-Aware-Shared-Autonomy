@@ -1,5 +1,3 @@
-"""Offline intent evaluation on saved signals, without generating interactions."""
-
 from __future__ import annotations
 
 import hashlib
@@ -22,7 +20,7 @@ METRICS = ("ipa", "accuracy", "nll", "brier", "early_prediction_seconds", "predi
 
 
 def _recorded_age(path: Path, demo: Demonstration, nominal: float) -> tuple[np.ndarray, str]:
-    """Use already synchronized source clocks; a nominal fallback is not a measurement."""
+
     with np.load(path, allow_pickle=False) as arrays:
         for key in ("observed_source_time", "observation_source_time", "source_time"):
             if key not in arrays:
@@ -49,13 +47,13 @@ def _recorded_age(path: Path, demo: Demonstration, nominal: float) -> tuple[np.n
 
 
 def intent_recordings(config: dict, prepared_root: Path, output: Path) -> list[dict]:
-    """Replay each held-out pickup signal once through every frozen estimator.
 
-    The supplied observed_state is already the state available to the operator.
-    It is never delayed again. The current position/velocity are used only by the
-    explicitly delay-unaware baselines. Intended goals label evaluation outcomes;
-    they are not inputs to an estimator or used to select its reference path.
-    """
+
+
+
+
+
+
     prepared_root, output = Path(prepared_root), Path(output)
     if output.exists() and any(output.iterdir()):
         raise ValueError("Recorded evaluation output must be empty to preserve existing analyses")

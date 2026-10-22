@@ -1,10 +1,3 @@
-"""Matched, demonstration-budget experiments with explicit unavailable cells.
-
-Training collections are supplied as recorded episodes, not manufactured to fill
-quotas. All policies share a frozen evaluation scene list. Inference is conditional
-on the supplied bootstrap corpus and uses the training repeat as its unit.
-"""
-
 from __future__ import annotations
 
 import copy
@@ -15,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from dasa.config import manifest, seed_everything, write_json
-from dasa.data import Demonstration
+from dasa.data import Demonstration, bootstrap_admission
 from dasa.experiments import load_split
 from dasa.geometry import Scene
 from dasa.scenes import generate_manifest, load_scene_manifest, validate_scene
@@ -27,12 +20,12 @@ from dasa.statistics import comparisons, holm
 
 
 def load_candidates(directory: Path) -> tuple[list[Demonstration], list[Path]]:
-    """Use an explicit acquisition order when supplied, otherwise lexical names.
 
-    An order.json file is a JSON list of relative NPZ filenames and must name
-    every recording exactly once. Scientific comparisons must not reorder this
-    list after seeing evaluation outcomes.
-    """
+
+
+
+
+
     files = sorted(directory.glob("*.npz"))
     order_path = directory / "order.json"
     if order_path.exists():
@@ -51,7 +44,9 @@ def load_candidates(directory: Path) -> tuple[list[Demonstration], list[Path]]:
             metadata = json.loads(str(data["metadata"]))
         if metadata.get("schema_version") == 1 and "goal" in metadata:
             demo = Demonstration.load(path)
-        elif "trial_id" in metadata and "intended_goal" in metadata:
+        elif (metadata.get("schema_version") == 1 and "trial_id" in metadata
+              and "intended_goal" in metadata
+              and metadata.get("provenance") == "synthetic_task_space_simulation"):
             demo = Trial.load(path).demonstration()
             demo.metadata["simulation_seed"] = metadata.get("seed")
             demo.metadata["recording_format"] = "simulation_trial"
@@ -108,14 +103,14 @@ def _freeze_scenes(config: dict, output: Path, source: Path | None) -> dict:
 
 def generalization(config: dict, prepared_root: Path, candidates_dir: Path,
                    output: Path, scene_manifest_path: Path | None = None) -> list[dict]:
-    """Evaluate fixed first-success prefixes against a bootstrap-only baseline.
 
-    Expected collection paths are candidates_dir/r{repeat}/C1/*.npz (also C2/C3).
-    Optional r{repeat}/bootstrap/splits.json supplies a distinct bootstrap corpus.
-    The simulation collection's sibling bootstrap/r{repeat} is also recognized.
-    Otherwise all fits are conditional on prepared_root/dataset. No repeat claims
-    independence of a bootstrap corpus that is actually shared.
-    """
+
+
+
+
+
+
+
     if output.exists() and any(output.iterdir()):
         raise ValueError("Generalization output must be empty to preserve frozen analyses")
     output.mkdir(parents=True, exist_ok=True)
@@ -160,7 +155,9 @@ def generalization(config: dict, prepared_root: Path, candidates_dir: Path,
             data_files.extend([bootstrap_data / "splits.json", *sorted(bootstrap_data.glob("*/*.npz"))])
         heldout_hashes = {demonstration_fingerprint(d)["signal_sha256"] for d in heldout}
         heldout_operators = {d.metadata["operator_id"] for d in heldout}
+        admission = bootstrap_admission(original, config)
         base = TPHSMM(config).fit(original)
+        base.fit_manifest["bootstrap_admission"] = admission
         base.save(output / f"models/r{repeat}/bootstrap.npz")
         fits = [("bootstrap", 0, base, [])]
         budget_rows.append({"repeat": repeat, "condition": "bootstrap", "refinement_budget": 0,
@@ -204,6 +201,7 @@ def generalization(config: dict, prepared_root: Path, candidates_dir: Path,
                 fit_config = copy.deepcopy(config)
                 fit_config["skill"]["refinement_count"] = budget
                 model, _, selected = refine(fit_config, original, accepted[:budget])
+                model.fit_manifest["bootstrap_admission"] = admission
                 model.save(output / f"models/r{repeat}/{condition}_n{budget}.npz")
                 fits.append((condition, budget, model, selected))
         for condition, budget, model, selected in fits:

@@ -87,6 +87,23 @@ def test_demonstration_timeout_uses_elapsed_duration(config):
     assert "timeout" not in reasons
 
 
+def test_measured_admission_uses_recorded_device_budget(config):
+    d = synthetic_demonstration(config, 1, "operator", "episode", 0)
+    d.metadata["provenance"] = "UR10_measured_teleoperation"
+    d.time = d.time * (30.0 / (d.time[-1] - d.time[0]))
+    d.metadata["execution_contract"] = {
+        "maximum_seconds": 60.0, "robot_radius_m": config["simulation"]["robot_radius"],
+        "place_tolerance_m": config["simulation"]["place_tolerance"],
+        "workspace_min_m": config["simulation"]["workspace_min"],
+        "workspace_max_m": config["simulation"]["workspace_max"]}
+    accepted, reasons = successful(d, config)
+    assert accepted, reasons
+    d.metadata["execution_contract"]["maximum_seconds"] = 25.0
+    assert "timeout" in successful(d, config)[1]
+    d.metadata["execution_contract"]["robot_radius_m"] = float("nan")
+    assert "invalid_execution_contract" in successful(d, config)[1]
+
+
 def test_holm_correction_and_missing_values():
     corrected = holm([.01, .04, .03, None])
     assert np.allclose(corrected[:3], [.03, .06, .06])

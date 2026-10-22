@@ -1,5 +1,3 @@
-"""Versioned demonstrations, atomic recording and leakage-resistant partitions."""
-
 from __future__ import annotations
 
 import json
@@ -86,7 +84,7 @@ class Demonstration:
 
 def synthetic_demonstration(config: dict, seed: int, operator: str, episode: str,
                             goal: int, noise: float | None = None) -> Demonstration:
-    """Quintic task-space demonstrations; these are never classified as participant data."""
+
     rng = np.random.default_rng(seed)
     bootstrap = config.get("bootstrap", {})
     noise = bootstrap.get("force_noise_std_N", 0.15) if noise is None else noise
@@ -102,7 +100,7 @@ def synthetic_demonstration(config: dict, seed: int, operator: str, episode: str
         u = np.arange(count) / count
         smooth = 10 * u**3 - 15 * u**4 + 6 * u**5
         path = start + smooth[:, None] * (end - start)
-        # Variability vanishes at task anchors and remains bounded between them.
+
         side = rng.normal(0, bootstrap.get("lateral_std_m", 0.008), 3)
         path += np.sin(np.pi * u)[:, None] ** 2 * side
         chunks.append(path)
@@ -187,26 +185,73 @@ def validate_partitions(root: Path, splits: dict) -> None:
 
 
 def successful(demo: Demonstration, config: dict) -> tuple[bool, list[str]]:
+    demo.validate()
     reasons = []
     m = demo.metadata
-    if not m["success"] or not m.get("placed", False):
+    limits = {"maximum_seconds": config["simulation"]["max_seconds"],
+              "robot_radius_m": config["simulation"]["robot_radius"],
+              "place_tolerance_m": config["simulation"]["place_tolerance"],
+              "workspace_min_m": config["simulation"]["workspace_min"],
+              "workspace_max_m": config["simulation"]["workspace_max"]}
+    if m["provenance"] == "UR10_measured_teleoperation" and "execution_contract" in m:
+        recorded = m["execution_contract"]
+        if not isinstance(recorded, dict) or any(key not in recorded for key in limits):
+            return False, ["invalid_execution_contract"]
+        limits = {key: recorded[key] for key in limits}
+        try:
+            lengths = np.asarray([limits[key] for key in
+                                  ("maximum_seconds", "robot_radius_m", "place_tolerance_m")], float)
+            lower, upper = np.asarray(limits["workspace_min_m"], float), np.asarray(limits["workspace_max_m"], float)
+            valid = (lengths.shape == (3,) and lower.shape == upper.shape == (3,)
+                     and np.isfinite(np.r_[lengths, lower, upper]).all()
+                     and np.all(lengths > 0) and np.all(lower < upper))
+        except (ValueError, TypeError):
+            valid = False
+        if not valid:
+            return False, ["invalid_execution_contract"]
+    for field in ("success", "placed", "collision", "bounds_violation"):
+        if field not in m:
+            reasons.append(f"missing_annotation:{field}")
+        elif not isinstance(m[field], bool):
+            reasons.append(f"invalid_annotation:{field}")
+    if "grasped_goal" not in m:
+        reasons.append("missing_annotation:grasped_goal")
+    elif m["grasped_goal"] is not None and (
+            isinstance(m["grasped_goal"], bool) or not isinstance(m["grasped_goal"], int)
+            or not 0 <= m["grasped_goal"] < len(demo.scene.goals)):
+        reasons.append("invalid_annotation:grasped_goal")
+    if m.get("success") is not True or m.get("placed") is not True:
         reasons.append("task_incomplete")
     if m.get("grasped_goal") != demo.goal:
         reasons.append("wrong_object")
-    if m.get("collision", False) or m.get("bounds_violation", False):
+    if m.get("collision") is not False or m.get("bounds_violation") is not False:
         reasons.append("contact_or_bounds")
-    if np.any(demo.position < np.asarray(config["simulation"]["workspace_min"])) or np.any(
-            demo.position > np.asarray(config["simulation"]["workspace_max"])):
+    if np.any(demo.position < np.asarray(limits["workspace_min_m"])) or np.any(
+            demo.position > np.asarray(limits["workspace_max_m"])):
         reasons.append("recorded_position_outside_workspace")
-    radii = config["simulation"]["robot_radius"]
+    radii = limits["robot_radius_m"]
     if any(demo.scene.swept_clearance(a, b, radii) <= 0
            for a, b in zip(demo.position[:-1], demo.position[1:])):
         reasons.append("swept_collision")
-    if np.linalg.norm(demo.position[-1] - demo.scene.place) > config["simulation"]["place_tolerance"]:
+    if np.linalg.norm(demo.position[-1] - demo.scene.place) > limits["place_tolerance_m"]:
         reasons.append("placement_error")
-    if demo.time[-1] - demo.time[0] > config["simulation"]["max_seconds"]:
+    if demo.time[-1] - demo.time[0] > limits["maximum_seconds"]:
         reasons.append("timeout")
     return not reasons, reasons
+
+
+def bootstrap_admission(demos: list[Demonstration], config: dict) -> list[dict]:
+    if not demos:
+        raise ValueError("Bootstrap training requires successful complete demonstrations")
+    audit = []
+    for demo in demos:
+        accepted, reasons = successful(demo, config)
+        audit.append({"episode_id": demo.metadata["episode_id"],
+                      "accepted": accepted, "reasons": reasons})
+    rejected = [row for row in audit if not row["accepted"]]
+    if rejected:
+        raise ValueError("Bootstrap demonstrations failed admission: " + json.dumps(rejected))
+    return audit
 
 
 def resample_positions(demo: Demonstration, count: int) -> np.ndarray:
